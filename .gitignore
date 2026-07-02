@@ -1,0 +1,22 @@
+# === 敏感文件 ===
+auth.json
+
+# === 浏览器配置（含 cookies/缓存/历史） ===
+browser_profile/
+
+# === 下载的附件（体积大，非源码） ===
+downloads/
+
+# === Python 编译缓存 ===
+__pycache__/
+*.pyc
+*.pyo
+
+# === 数据文件（非源码） ===
+*.xlsx
+*.xlsm
+*.msg
+*.pdf
+
+# === 编辑器个人配置 ===
+.vscode/
