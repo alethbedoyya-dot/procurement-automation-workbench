@@ -379,6 +379,21 @@ def add_extra_columns():
 TRACKING_FILE = os.path.join(SCRIPT_DIR, "NI PM Saving Tracking.xlsx")
 TRACKING_SHEET = "Base Data"
 TRACKING_PROJECT_COL = "Project Name"
+FUZZY_MATCH_THRESHOLD = 0.6  # n-gram 相似度阈值，精确子串匹配失败时启用
+
+
+def _ngram_similarity(s1, s2, n=2):
+    """计算两个字符串的 n-gram 相似度（0.0~1.0），用于模糊匹配兜底。"""
+    s1 = s1.lower()
+    s2 = s2.lower()
+    if len(s1) < n or len(s2) < n:
+        return 0.0
+    ng1 = {s1[i:i+n] for i in range(len(s1) - n + 1)}
+    ng2 = {s2[i:i+n] for i in range(len(s2) - n + 1)}
+    if not ng1 or not ng2:
+        return 0.0
+    intersection = ng1 & ng2
+    return len(intersection) / min(len(ng1), len(ng2))
 
 
 def match_pm_tracking_data():
@@ -410,6 +425,7 @@ def match_pm_tracking_data():
 
     e2e_col = None
     order_value_col = None   # 订单净值（列B "求和项:订单净值"）
+    po_col = None             # 采购凭证
     price_col = None
     plancost_col = None
     total_saving_col = None
@@ -421,6 +437,8 @@ def match_pm_tracking_data():
             e2e_col = col
         elif val == "求和项:订单净值":
             order_value_col = col
+        elif val == "采购凭证":
+            po_col = col
         elif val == "Price":
             price_col = col
         elif val == "PlanCost":
@@ -443,12 +461,13 @@ def match_pm_tracking_data():
             f"请先点击「添加扩展列」按钮。"
         )
 
-    # ── 2. 收集所有 E2E项目名（跳过空值）──
-    project_names = []  # (row_number, project_name)
+    # ── 2. 收集所有 E2E项目名和采购凭证（跳过空值）──
+    project_names = []  # (row_number, project_name, po_number)
     for row in range(2, ws.max_row + 1):
         val = str(ws.cell(row, e2e_col).value or "").strip()
         if val:
-            project_names.append((row, val))
+            po_val = str(ws.cell(row, po_col).value or "").strip() if po_col else ""
+            project_names.append((row, val, po_val))
 
     if not project_names:
         wb.close()
@@ -471,6 +490,7 @@ def match_pm_tracking_data():
     project_col = None
     track_price_col = None
     track_plancost_col = None
+    track_content_col = None
 
     for col in range(1, ws_track.max_column + 1):
         val = str(ws_track.cell(HEADER_ROW, col).value or "").strip()
@@ -480,6 +500,8 @@ def match_pm_tracking_data():
             track_price_col = col
         elif val == "PlanCost":
             track_plancost_col = col
+        elif val == "Content":
+            track_content_col = col
 
     # 诊断：找不到列时打印表头所有非空列
     def _tracking_headers():
@@ -515,10 +537,12 @@ def match_pm_tracking_data():
 
     # 收集 Tracking 中所有行数据（iter_rows 批量读取，比逐格快100倍+）
     tracking_rows = []
-    max_col = max(project_col, track_price_col, track_plancost_col)
+    max_col = max(project_col, track_price_col, track_plancost_col,
+                  track_content_col or 0)
     idx_pn = project_col - 1
     idx_price = track_price_col - 1
     idx_pc = track_plancost_col - 1
+    idx_content = (track_content_col - 1) if track_content_col else None
     for row_vals in ws_track.iter_rows(
         min_row=HEADER_ROW + 1,
         min_col=1, max_col=max_col,
@@ -526,10 +550,12 @@ def match_pm_tracking_data():
     ):
         pn_val = str(row_vals[idx_pn] or "").strip()
         if pn_val:
+            content_val = str(row_vals[idx_content] or "").strip() if idx_content is not None else ""
             tracking_rows.append((
                 pn_val.lower(),  # 预计算小写，加速后续匹配
                 row_vals[idx_price],
                 row_vals[idx_pc],
+                content_val,
             ))
 
     wb_track.close()
@@ -540,16 +566,53 @@ def match_pm_tracking_data():
     unmatched = 0
     unmatched_samples = []
     na_count = 0
+    fuzzy_match_count = 0
+    zhuanghuang_multi_count = 0
+    zhuanghuang_multi_list = []
+    other_multi_count = 0
+    other_multi_list = []
 
-    for row_num, pn in project_names:
+    for row_num, pn, po_num in project_names:
         pn_lower = pn.lower()
 
-        # 找第一个模糊匹配的 tracking 行
-        found_track = None
-        for t_pn, t_price, t_plancost in tracking_rows:
+        # 第一轮：精确子串匹配
+        all_matches = []
+        for t_pn, t_price, t_plancost, t_content in tracking_rows:
             if pn_lower in t_pn:  # t_pn 已在收集时预计算为小写
-                found_track = (t_pn, t_price, t_plancost)
-                break
+                all_matches.append((t_pn, t_price, t_plancost, t_content))
+
+        # 兜底：精确匹配无结果时，用 n-gram 模糊匹配
+        is_fuzzy = False
+        if not all_matches:
+            best_score = 0.0
+            best_match = None
+            for t_pn, t_price, t_plancost, t_content in tracking_rows:
+                score = _ngram_similarity(pn_lower, t_pn)
+                if score > best_score:
+                    best_score = score
+                    best_match = (t_pn, t_price, t_plancost, t_content)
+            if best_score >= FUZZY_MATCH_THRESHOLD and best_match:
+                all_matches = [best_match]
+                is_fuzzy = True
+
+        # 筛选 Content 以"装潢"开头的行
+        zhuanghuang_matches = [m for m in all_matches if m[3].startswith("装潢")]
+
+        found_track = None
+        if zhuanghuang_matches:
+            if len(zhuanghuang_matches) > 1:
+                # 多行装潢匹配 → 跳过并记录
+                zhuanghuang_multi_count += 1
+                zhuanghuang_multi_list.append((po_num, pn))
+                continue
+            found_track = zhuanghuang_matches[0]
+        elif all_matches:
+            if len(all_matches) > 1:
+                # 无装潢行，但多行非装潢匹配 → 跳过并记录
+                other_multi_count += 1
+                other_multi_list.append((po_num, pn))
+                continue
+            found_track = all_matches[0]
 
         if found_track is None:
             unmatched += 1
@@ -558,7 +621,9 @@ def match_pm_tracking_data():
             continue
 
         matched += 1
-        _, t_price, t_plancost = found_track
+        if is_fuzzy:
+            fuzzy_match_count += 1
+        _, t_price, t_plancost, _ = found_track
 
         # 读取订单净值
         order_value = ws.cell(row_num, order_value_col).value
@@ -605,8 +670,24 @@ def match_pm_tracking_data():
         f"匹配成功：{matched}（已写入 Price/PlanCost/总saving/SAVING差异: {written}）",
         f"未匹配（跳过）：{unmatched}",
     ]
+    if fuzzy_match_count > 0:
+        summary_lines.append(f"其中模糊匹配（n-gram 兜底）：{fuzzy_match_count}")
     if na_count > 0:
         summary_lines.append(f"Price 为 0/空（填入 N/A）：{na_count}")
+    if zhuanghuang_multi_count > 0:
+        summary_lines.extend([
+            f"",
+            f"跳过多行装潢匹配（{zhuanghuang_multi_count} 个）：",
+        ])
+        for po, pn in zhuanghuang_multi_list:
+            summary_lines.append(f"  · PO {po} — {pn}（装潢匹配到多行，无法确定唯一行）")
+    if other_multi_count > 0:
+        summary_lines.extend([
+            f"",
+            f"跳过多行非装潢匹配（{other_multi_count} 个）：",
+        ])
+        for po, pn in other_multi_list:
+            summary_lines.append(f"  · PO {po} — {pn}（匹配到多行且均非装潢，无法确定唯一行）")
     summary_lines.extend([
         f"",
         f"Tracking 文件总行数：{len(tracking_rows)}",

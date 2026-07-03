@@ -6,8 +6,10 @@ TKE VIEW 网站自动化查询模块
   1. 从「装潢透视表」Sheet 提取全部采购凭证号
   2. Playwright 启动 Edge → 登录 TKE VIEW（Microsoft SSO，会话持久化）
   3. 逐个 PO：跳转搜索页 → 填PO号 → 查找 → 点击请求ID → 详情页
-  4. 详情页提取：项目名称 / 梯台明细合计数量 / 下载支持文件
-  5. PDF 解析「总计（不含税）」→ 计算差异 → 写回 Excel
+  4. 详情页提取：项目名称 / 梯台明细合计数量 / 下载全部附件
+  5. 附件分类：FLD 开头 → downloads/FLD文件/<PO号>/
+               非 FLD   → downloads/无FLD文件/<PO号>/
+  6. FLD .msg 解析审批价格 → 计算差异 → 写回 Excel
 
 会话管理：
   → 首次运行需手动完成 Microsoft 账户登录
@@ -33,11 +35,17 @@ SEARCH_URL = "https://view.tkelevator.com.cn/vivid/niops/purchasing/materials/se
 AUTH_FILE = os.path.join(SCRIPT_DIR, "auth.json")
 RUN_LOG_FILE = os.path.join(SCRIPT_DIR, "automation_run_log.txt")
 DOWNLOAD_DIR = os.path.join(SCRIPT_DIR, "downloads")
+FLD_DIR = os.path.join(DOWNLOAD_DIR, "FLD文件")
+NO_FLD_DIR = os.path.join(DOWNLOAD_DIR, "无FLD文件")
 PAGE_SCAN_FILE = os.path.join(SCRIPT_DIR, "page_scan.txt")
 PDF_PARSE_TIMEOUT = 45
 OCR_TIMEOUT = 60
 TARGET_MSG_PREFIXES = ("fld",)
 APPROVAL_PRICE_LABEL = "\u5ba1\u6279\u4ef7\u683c"
+
+# ── 测试模式 ──
+TEST_MODE = False       # True=仅处理前N个PO, False=全量
+TEST_LIMIT = 7           # 测试模式下处理的PO数量
 
 
 # ═══════════════════ PO 号提取 ═══════════════════
@@ -354,7 +362,8 @@ def _extract_project_name(page, log):
 def _extract_order_qty(page, log):
     """
     从详情页「梯台明细」表中提取合计行的数量值。
-    方法：找表格→定位「数量」列→定位「合计」行→取交叉单元格。
+    策略1：找表格→定位「数量」列→定位「合计」行→取交叉单元格。
+    策略2（兜底）：找不到「合计」行时，取表格末行的数量列值。
     """
     try:
         # 滚动到梯台明细区域
@@ -370,7 +379,7 @@ def _extract_order_qty(page, log):
                 if not table.is_visible():
                     continue
                 tbl_text = table.inner_text()
-                if "数量" not in tbl_text or "合计" not in tbl_text:
+                if "数量" not in tbl_text:
                     continue
 
                 # 找「数量」列索引
@@ -390,7 +399,7 @@ def _extract_order_qty(page, log):
                 if qty_col is None:
                     continue
 
-                # 找「合计」行 → 取数量列单元格
+                # 策略1：找「合计」行 → 取数量列单元格
                 for row in table.locator("tr").all():
                     row_text = row.inner_text() or ""
                     if "合计" not in row_text:
@@ -401,6 +410,20 @@ def _extract_order_qty(page, log):
                         if val:
                             log(f"  梯台明细合计数量: {val}")
                             return val
+
+                # 策略2：兜底 — 末行取值（合计行可能不以"合计"文字出现）
+                all_rows = table.locator("tr").all()
+                for row in reversed(all_rows):
+                    row_text = (row.inner_text() or "").strip()
+                    if not row_text:
+                        continue
+                    cells = row.locator("td, th").all()
+                    if len(cells) > qty_col:
+                        val = cells[qty_col].inner_text().strip()
+                        if val and re.match(r'^[\d,.]+$', val):
+                            log(f"  梯台明细合计数量（末行兜底）: {val}")
+                            return val
+                    break  # 只尝试最后一个非空行
             except Exception:
                 continue
     except Exception:
@@ -439,6 +462,75 @@ def _is_target_msg_filename(name):
     return lower.endswith(".msg") and lower.startswith(TARGET_MSG_PREFIXES)
 
 
+def _extract_any_file_name(text):
+    """Extract a filename (with extension) from link text or URL-like text (any file type)."""
+    if not text:
+        return ""
+    value = str(text).strip()
+    try:
+        from urllib.parse import unquote
+        value = unquote(value)
+    except Exception:
+        pass
+    # Match filenames with common extensions
+    pattern = r"(?:^|[\\/\s=&?])([^\\/\r\n<>]*?\.[a-zA-Z0-9]{2,5})(?:\s|$|[\\/?&])"
+    match = re.search(pattern, value)
+    if not match:
+        return ""
+    name = match.group(1).strip().strip("'\"")
+    return os.path.basename(name)
+
+
+def _link_file_name(link):
+    """Extract filename from a link element (any file type, not just FLD .msg)."""
+    candidates = []
+    try:
+        candidates.append(link.inner_text().strip())
+    except Exception:
+        pass
+    for attr in ("download", "title", "aria-label", "href"):
+        try:
+            value = link.get_attribute(attr)
+            if value:
+                candidates.append(value)
+        except Exception:
+            pass
+    for candidate in candidates:
+        name = _extract_any_file_name(candidate)
+        if name:
+            return name
+    return ""
+
+
+def _classify_file(file_name):
+    """Classify a file as 'fld' (starts with fld) or 'non_fld'."""
+    lower = (file_name or "").lower()
+    if lower.startswith("fld"):
+        return "fld"
+    return "non_fld"
+
+
+def _extract_project_from_fld_name(filename, log):
+    """
+    兜底：从 FLD 文件名中提取项目名称。
+    文件名格式: FLD新物料价格审批--<项目名>--<分类>--价格审批回复.msg
+    策略：-- 分割后，取中间片段中「包含中文且最长」的作为项目名。
+    """
+    name = os.path.basename(str(filename or ""))
+    parts = name.split("--")
+    if len(parts) < 3:
+        return None
+    best = None
+    for part in parts[1:-1]:  # 跳过首段(FLD前缀)和末段(价格审批回复.msg)
+        part = part.strip()
+        if any('\u4e00' <= c <= '\u9fff' for c in part):
+            if best is None or len(part) > len(best):
+                best = part
+    if best:
+        log(f"  项目名称（FLD文件名兜底）: {best[:60]}")
+    return best
+
+
 def _target_msg_name_from_link(link):
     candidates = []
     try:
@@ -460,8 +552,8 @@ def _target_msg_name_from_link(link):
     return ""
 
 
-def _collect_target_msg_links(page):
-    """Collect FLD .msg links from the detail page."""
+def _collect_all_attachment_links(page):
+    """Collect ALL attachment links from the detail page (not just FLD .msg)."""
     selectors = [
         "//th[contains(text(),'\u652f\u6301\u6587\u4ef6')]/ancestor::table//a",
         "//td[contains(text(),'\u652f\u6301\u6587\u4ef6')]/ancestor::table//a",
@@ -475,7 +567,12 @@ def _collect_target_msg_links(page):
         except Exception:
             continue
         for link in links:
-            name = _target_msg_name_from_link(link)
+            try:
+                if not link.is_visible():
+                    continue
+            except Exception:
+                pass
+            name = _link_file_name(link)
             if not name:
                 continue
             try:
@@ -490,14 +587,15 @@ def _collect_target_msg_links(page):
     return found
 
 
-def _download_support_files(page, log, subfolder=""):
+def _download_support_files(page, log, po):
     """
-    滚动到「审批记录」区域，只下载 FLD 开头的 .msg 审批邮件。
-    subfolder: 存放在 downloads/子文件夹/ 下（如项目名称）。
-    返回已下载的文件名列表。
+    下载详情页中的全部附件，存入同一目录。
+    有 FLD 附件 → downloads/FLD文件/<PO号>/（全部文件，含非FLD）
+    无 FLD 附件 → downloads/无FLD文件/<PO号>/
+    返回: {fld_files: [...], non_fld_files: [...]}
     """
-    target_dir = os.path.join(DOWNLOAD_DIR, subfolder) if subfolder else DOWNLOAD_DIR
-    os.makedirs(target_dir, exist_ok=True)
+    fld_target = os.path.join(FLD_DIR, str(po))
+    non_fld_target = os.path.join(NO_FLD_DIR, str(po))
 
     # 滚动到审批记录区域
     try:
@@ -507,36 +605,50 @@ def _download_support_files(page, log, subfolder=""):
     except Exception:
         pass
 
-    downloaded = []
-    file_links = _collect_target_msg_links(page)
-    if not file_links:
-        log("  未发现 FLD 开头的 .msg 审批附件。")
-        return downloaded
+    fld_files = []
+    non_fld_files = []
+    all_links = _collect_all_attachment_links(page)
+    if not all_links:
+        log("  未发现任何附件链接。")
+        return {"fld_files": fld_files, "non_fld_files": non_fld_files}
 
-    for link, file_name in file_links:
+    # 有任一 FLD 文件 → 全部存入 FLD文件夹；否则存入 无FLD文件夹
+    has_any_fld = any(_classify_file(name) == "fld" for _, name in all_links)
+    if has_any_fld:
+        target_dir = fld_target
+        dir_label = "FLD文件"
+    else:
+        target_dir = non_fld_target
+        dir_label = "无FLD文件"
+    os.makedirs(target_dir, exist_ok=True)
+
+    for link, file_name in all_links:
         try:
-            log(f"  正在下载 FLD msg: {file_name}")
+            category = _classify_file(file_name)
+            log(f"  正在下载: {file_name} [{category}]")
             with page.expect_download(timeout=30000) as download_info:
                 link.click()
             download = download_info.value
 
             safe_name = file_name.replace("/", "_").replace("\\", "_").replace(":", "_")
             suggested = download.suggested_filename or ""
-            suggested_target = _extract_target_msg_name(suggested)
-            if suggested_target:
-                safe_name = suggested_target.replace("/", "_").replace("\\", "_").replace(":", "_")
+            if suggested:
+                suggested = os.path.basename(suggested)
+                safe_name = suggested.replace("/", "_").replace("\\", "_").replace(":", "_")
 
             save_path = os.path.join(target_dir, safe_name)
             download.save_as(save_path)
-            downloaded.append(safe_name)
-            log(f"    ✓ 已保存: {subfolder + '/' if subfolder else ''}{safe_name}")
+            if category == "fld":
+                fld_files.append(safe_name)
+            else:
+                non_fld_files.append(safe_name)
+            log(f"    ✓ 已保存: {dir_label}/{po}/{safe_name}")
             time.sleep(0.5)
         except Exception as e:
             log(f"    ✗ 下载失败: {str(e)[:100]}")
 
-    if not downloaded:
-        log("  未下载到 FLD 开头的 .msg 审批附件。")
-    return downloaded
+    log(f"  附件下载完成: FLD {len(fld_files)} 个, 非FLD {len(non_fld_files)} 个 → {dir_label}")
+    return {"fld_files": fld_files, "non_fld_files": non_fld_files}
 
 
 def _has_fld_msg_attachment(page, log):
@@ -552,12 +664,13 @@ def _has_fld_msg_attachment(page, log):
     except Exception:
         pass
 
-    file_links = _collect_target_msg_links(page)
-    if file_links:
-        log(f"  ✓ 发现 FLD .msg 附件: {file_links[0][1][:80]}")
-        return True
+    all_links = _collect_all_attachment_links(page)
+    for _, name in all_links:
+        if _classify_file(name) == "fld":
+            log(f"  ✓ 发现 FLD 附件: {name[:80]}")
+            return True
 
-    log("  未发现 FLD 开头的 .msg 附件，跳过此 PO")
+    log("  未发现 FLD 开头的附件")
     return False
 
 
@@ -1123,7 +1236,8 @@ def _process_one_po(po, context, log):
             log(f"  ⚠ 未能进入详情页")
             result["project_name"] = None
             result["order_qty"] = None
-            result["downloaded"] = []
+            result["fld_files"] = []
+            result["non_fld_files"] = []
         else:
             log(f"  详情页已打开，等待加载...")
             time.sleep(2)
@@ -1140,46 +1254,27 @@ def _process_one_po(po, context, log):
             except Exception:
                 pass
 
-            # ── 4.5 检查 FLD .msg 附件 ──
-            if not _has_fld_msg_attachment(detail_page, log):
-                has_other_msg = _has_any_msg_attachment(detail_page)
-                result["skip"] = True
-                result["has_msg_no_fld"] = has_other_msg
+            # ── 5. 下载全部附件（按 PO 号分文件夹，FLD/非FLD 分类）──
+            dl_result = _download_support_files(detail_page, log, po)
+            result["fld_files"] = dl_result.get("fld_files", [])
+            result["non_fld_files"] = dl_result.get("non_fld_files", [])
+            log(f"  附件下载: FLD {len(result['fld_files'])} 个, 非FLD {len(result['non_fld_files'])} 个")
+
+            has_fld = len(result["fld_files"]) > 0
+
+            # ── 6. 有 FLD 附件时：提取项目名称和梯台明细数量（用于 Excel 写回）──
+            if has_fld:
+                result["project_name"] = _extract_project_name(detail_page, log)
+                # 兜底：网页提取失败时从 FLD 文件名提取项目名称
+                if not result["project_name"] and result["fld_files"]:
+                    result["project_name"] = _extract_project_from_fld_name(
+                        result["fld_files"][0], log
+                    )
+                result["order_qty"] = _extract_order_qty(detail_page, log)
+            else:
+                log(f"  ⓘ PO {po} 无 FLD 附件，跳过项目名称/数量提取")
                 result["project_name"] = None
                 result["order_qty"] = None
-                result["downloaded"] = []
-                if detail_page != po_page:
-                    try:
-                        detail_page.close()
-                    except Exception:
-                        pass
-                reason = "有MSG但非FLD" if has_other_msg else "无 FLD .msg"
-                log(f"  ✓ PO {po} 跳过（{reason}）")
-                return result
-
-            # ── 5. 提取项目名称（先于下载，用作子文件夹名）──
-            result["project_name"] = _extract_project_name(detail_page, log)
-            project_dir = result["project_name"] or str(po)
-            # 清理文件夹非法字符
-            project_dir = re.sub(r'[\\/:*?"<>|]', '_', project_dir)
-            result["download_subdir"] = project_dir
-
-            # ── 6. 下载支持文件（存入项目子文件夹）──
-            result["downloaded"] = _download_support_files(detail_page, log, subfolder=project_dir)
-            log(f"  附件下载: {len(result['downloaded'])} 个")
-            if not result["downloaded"]:
-                result["skip"] = True
-                result["has_msg_no_fld"] = False
-                if detail_page != po_page:
-                    try:
-                        detail_page.close()
-                    except Exception:
-                        pass
-                log(f"  ✓ PO {po} 跳过（FLD .msg 未下载成功）")
-                return result
-
-            # ── 7. 提取梯台明细合计数量 ──
-            result["order_qty"] = _extract_order_qty(detail_page, log)
 
             # 关闭详情页
             if detail_page != po_page:
@@ -1206,31 +1301,33 @@ def _finalize_po_result(result, log):
 
     # ── FLD .msg 解析 → 提取审批价格 ──
     total_amount = None
-    downloaded = result.get("downloaded", [])
-    if downloaded:
-        log("  解析附件...")
-        subdir = result.get("download_subdir", "")
+    fld_files = result.get("fld_files", [])
+    if fld_files:
+        log("  解析 FLD 附件...")
+        fld_target = os.path.join(FLD_DIR, str(po))
 
-        # 找 FLD .msg 文件
+        # 找第一个 FLD .msg 文件
         fld_msg = None
-        for fname in downloaded:
-            if _is_target_msg_filename(fname):
+        for fname in fld_files:
+            if fname.lower().endswith(".msg"):
                 fld_msg = fname
                 break
 
         if fld_msg:
-            fpath = os.path.join(DOWNLOAD_DIR, subdir, fld_msg) if subdir else os.path.join(DOWNLOAD_DIR, fld_msg)
+            fpath = os.path.join(fld_target, fld_msg)
             if os.path.exists(fpath):
                 total_amount = _extract_approval_price_from_msg(fpath, log)
             else:
                 log(f"  FLD .msg 文件不存在: {fld_msg}")
         else:
-            log("  未找到 FLD .msg 文件")
+            log("  FLD 附件中未找到 .msg 文件")
 
         if total_amount:
             log(f"  审批价格: {total_amount}")
         else:
             log("  未从 FLD .msg 中解析到审批价格")
+    else:
+        log("  无 FLD 附件，跳过审批价格解析")
     result["total_amount"] = total_amount
 
     # ── 读取订单净值 → 计算差异 ──
@@ -1249,11 +1346,11 @@ def _finalize_po_result(result, log):
     result["order_diff"] = order_diff
 
     # ── 统计非 PDF 附件 ──
-    non_pdf = [f for f in downloaded if not f.lower().endswith(".pdf")]
+    non_pdf = [f for f in fld_files if not f.lower().endswith(".pdf")]
     result["non_pdf_count"] = len(non_pdf)
 
     # ── 写回 Excel ──
-    support_files_str = "; ".join(downloaded) if downloaded else ""
+    support_files_str = "; ".join(fld_files) if fld_files else ""
     diff_str = str(order_diff) if order_diff is not None else None
     total_str = str(total_amount) if total_amount is not None else None
 
@@ -1357,10 +1454,15 @@ def open_website_and_search(status_callback=None):
         except Exception:
             pass
 
-        # ── 4. 循环处理每个 PO（测试模式：前7个）──
-        test_pos = all_pos[:7]
-        total = len(test_pos)
-        log(f"[测试模式] 仅处理前 {total} 个 PO")
+        # ── 4. 循环处理每个 PO ──
+        if TEST_MODE:
+            test_pos = all_pos[:TEST_LIMIT]
+            total = len(test_pos)
+            log(f"[测试模式] 仅处理前 {total} 个 PO")
+        else:
+            test_pos = all_pos
+            total = len(test_pos)
+            log(f"[正式模式] 处理全部 {total} 个 PO")
 
         success_count = 0
         fail_count = 0
@@ -1410,8 +1512,8 @@ def open_website_and_search(status_callback=None):
                 log("")
                 log(f"━━━ [本地 {j}/{len(web_results)}] PO: {po} ━━━")
                 try:
-                    if result.get("skip"):
-                        log(f"  ⏭ PO {po} 已跳过（无 FLD .msg），跳过本地解析")
+                    if not result.get("fld_files"):
+                        log(f"  ⏭ PO {po} 无 FLD 附件，跳过本地解析")
                         continue
                     _finalize_po_result(result, log)
                     finalize_success += 1
@@ -1439,10 +1541,10 @@ def open_website_and_search(status_callback=None):
             summary += f"\n\n⚠ {len(no_amount_pos)} 个项目未获取到审批金额："
             for p in no_amount_pos:
                 summary += f"\n  - {p}"
-        msg_no_fld_pos = [r.get("po") for r in web_results if r.get("has_msg_no_fld")]
-        if msg_no_fld_pos:
-            summary += f"\n\n⚠ {len(msg_no_fld_pos)} 个PO有MSG文件但非FLD（未提取金额）："
-            for p in msg_no_fld_pos:
+        no_fld_download_pos = [r.get("po") for r in web_results if not r.get("fld_files")]
+        if no_fld_download_pos:
+            summary += f"\n\nℹ {len(no_fld_download_pos)} 个PO无FLD附件（仅下载非FLD文件至「无FLD文件」目录）："
+            for p in no_fld_download_pos:
                 summary += f"\n  - {p}"
         if failed_pos:
             summary += f"\n\n失败 PO ({len(failed_pos)} 个):\n"

@@ -955,10 +955,10 @@ def open_website_and_search(status_callback=None):
         except Exception:
             pass
 
-        # ── 4. 循环处理每个 PO（测试模式：前5个）──
-        test_pos = all_pos[:5]
+        # ── 4. 循环处理每个 PO（正式模式：全部）──
+        test_pos = all_pos
         total = len(test_pos)
-        log(f"[测试模式] 仅处理前 {total} 个 PO")
+        log(f"[正式模式] 处理全部 {total} 个 PO")
 
         success_count = 0
         fail_count = 0
