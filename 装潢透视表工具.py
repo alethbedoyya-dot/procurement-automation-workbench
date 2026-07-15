@@ -26,7 +26,8 @@ import time
 import traceback
 import threading
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
+from tkinter import ttk
 
 
 # ═══════════════════ 配置区 ═══════════════════
@@ -35,28 +36,24 @@ from tkinter import messagebox
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 主数据文件
-EXCEL_FILE = os.path.join(SCRIPT_DIR, "EXPORT1 2 1.xlsx")
+EXCEL_FILE = os.path.join(SCRIPT_DIR, "采购记录0701.xlsx")
+DOWNLOAD_DIR = os.path.join(SCRIPT_DIR, "downloads")
 
-# 工厂清单（Plant → 区域 + 分公司 映射表）
+# 工厂清单（Plant → 区域 + 分公司 映射表，仅装潢品类需要）
 FACTORY_FILE = os.path.join(SCRIPT_DIR, "工厂清单 7.XLSX")
 
-# Sheet 名称
+# 通用 Sheet 名称
 SOURCE_SHEET = "Sheet1"                  # 数据源（主数据所在 Sheet）
-DATA_SHEET = "装潢数据"                   # 筛选后的中间数据 Sheet
-TARGET_SHEET = "装潢透视表"               # 目标透视表 Sheet
 
-# 透视表结构
+# 透视表结构（所有品类通用）
 ROW_FIELDS = ["区域", "分公司", "供应商名称", "采购凭证"]
 VALUE_FIELD = "订单净值"
 VALUE_NAME = "求和项:订单净值"
 
-# 物料筛选条件
-FILTER_MATERIALS = [1000027307, 1000027308]
-
-# 校验所需列（含将要新增的列）
+# 校验所需列
 CHECK_COLS = ["工厂", "物料", "供应商名称", "采购凭证", "订单净值"]
 
-# 透视表右侧扩展列（预留，后续手动填入）
+# 透视表右侧扩展列（预留，后续手动填入，所有品类通用）
 EXTRA_COLUMNS = [
     "E2E项目名",
     "E2E订单数量",
@@ -66,8 +63,48 @@ EXTRA_COLUMNS = [
     "Price",
     "PlanCost",
     "总saving",
-    "SAVING差异",
+    "订单是否下完=price-订单净值",
 ]
+
+# ═══════════════════ 品类配置 ═══════════════════
+
+CATEGORIES = {
+    "装潢": {
+        "label": "装潢",
+        "filter_materials": [1000027307, 1000027308],
+        "data_sheet": "装潢数据",
+        "target_sheet": "装潢透视表",
+        "pivot_table_name": "装潢透视表",
+        "content_filter": "装潢",                    # PM Tracking Content 列筛选关键词
+        "insert_cols_after_order": [],               # 区域/分公司已由独立按钮处理
+        "insert_col_at_end": None,                   # 在 Sheet1 末尾插入的列（None=不插入）
+    },
+    "空调": {
+        "label": "空调",
+        "filter_materials": [1000027316],
+        "data_sheet": "空调数据",
+        "target_sheet": "空调透视表",
+        "pivot_table_name": "空调透视表",
+        "content_filter": "AC空调",
+        "content_filter_values": ("AC", "AC空调"),
+        "content_filter_display": "AC / AC空调",
+        "content_filter_exact_on_multiple_matches": True,
+        "insert_cols_after_order": ["老价格", "新价格", "Saving"],
+        "insert_col_at_end": "CHECK",
+    },
+}
+
+# 向后兼容：保留全局变量指向装潢默认配置（旧代码无参调用仍然有效）
+ACTIVE_CATEGORY = "装潢"
+
+def _cfg(category=None):
+    """获取品类配置，默认使用 ACTIVE_CATEGORY"""
+    return CATEGORIES[category or ACTIVE_CATEGORY]
+
+# 向后兼容别名（旧代码引用这些全局变量时自动指向装潢配置）
+DATA_SHEET = CATEGORIES["装潢"]["data_sheet"]
+TARGET_SHEET = CATEGORIES["装潢"]["target_sheet"]
+FILTER_MATERIALS = CATEGORIES["装潢"]["filter_materials"]
 
 # Excel COM 常量
 XlDatabase = 1
@@ -89,6 +126,19 @@ def _col_letter(idx):
 
 def _com_start():
     """启动 Excel COM 实例"""
+    # 清除 pywin32 COM 缓存，避免 CLSIDToClassMap 错误
+    import shutil
+    for tmp_base in (
+        os.environ.get("TEMP", ""),
+        os.path.join(os.environ.get("USERPROFILE", ""), "AppData", "Local", "Temp"),
+    ):
+        gen_py = os.path.join(tmp_base, "gen_py")
+        if os.path.isdir(gen_py):
+            try:
+                shutil.rmtree(gen_py, ignore_errors=True)
+            except Exception:
+                pass
+
     import pythoncom
     pythoncom.CoInitialize()
     from win32com.client import Dispatch
@@ -128,11 +178,11 @@ def _com_try_open(excel, path):
         return None
 
 
-def _com_create_pivot(wb_com, total_cols, total_rows, source_name=DATA_SHEET):
+def _com_create_pivot(wb_com, total_cols, total_rows, source_name, target_sheet, pivot_table_name):
     """在 COM 工作簿中创建/更新透视表"""
     # 删除旧透视表 Sheet
     for s in list(wb_com.Sheets):
-        if s.Name == TARGET_SHEET:
+        if s.Name == target_sheet:
             s.Delete()
             break
 
@@ -143,7 +193,7 @@ def _com_create_pivot(wb_com, total_cols, total_rows, source_name=DATA_SHEET):
     # 在 Sheet1 右侧新建透视表 Sheet
     sheet1 = wb_com.Sheets(SOURCE_SHEET)
     new_ws = wb_com.Sheets.Add(After=sheet1)
-    new_ws.Name = TARGET_SHEET
+    new_ws.Name = target_sheet
 
     # 创建数据透视表缓存
     pivot_cache = wb_com.PivotCaches().Create(
@@ -152,7 +202,7 @@ def _com_create_pivot(wb_com, total_cols, total_rows, source_name=DATA_SHEET):
 
     # 在工作表上创建透视表
     pivot_table = pivot_cache.CreatePivotTable(
-        TableDestination=new_ws.Cells(1, 1), TableName="装潢透视表"
+        TableDestination=new_ws.Cells(1, 1), TableName=pivot_table_name
     )
 
     # 添加行字段（层级顺序）
@@ -173,6 +223,7 @@ def _build_plant_mapping(_log):
     """
     读取 工厂清单 7.XLSX，建立 Plant → (区域, 分公司) 映射字典。
     按列位置读取：A=Plant, J=区域(英文), K=分公司(拼音)
+    （由独立的「匹配区域/分公司」按钮调用，品类无关）
     """
     import pandas as pd
     _log("正在读取工厂清单...")
@@ -206,37 +257,52 @@ def _build_plant_mapping(_log):
     return plant_map, "\n".join(debug_lines)
 
 
-def _enhance_and_filter(plant_map, _log):
-    """
-    openpyxl 增强 Sheet1：
-      1. 找到"订单净值"列 → 在右侧插入两列："区域""分公司"
-      2. 按"工厂"列值查 plant_map → 填入区域和分公司
-      3. pandas 读增强后的数据 → 筛选 物料∈{1000027307, 1000027308}
-      4. 将筛选结果写入新 Sheet "装潢数据"
-    返回: (total_cols, total_rows) 筛选后数据的行列数（供 COM 透视表使用）
-    """
-    import openpyxl, pandas as pd
+# ═══════════════════ 独立工厂映射 ═══════════════════
 
-    # ── 1. 打开原文件，找列位置 ──
+def apply_factory_mapping(status_callback=None):
+    """
+    独立功能：读取工厂清单，在 Sheet1 插入/更新「区域」「分公司」列。
+    品类无关，跑一次即可。正式员工无论先做装潢还是空调，都可先点此按钮。
+    """
+    import openpyxl
+
+    _log = lambda msg: status_callback and status_callback(msg)
+
+    if not os.path.exists(EXCEL_FILE):
+        return False, f"找不到主数据文件：\n{EXCEL_FILE}"
+    if not os.path.exists(FACTORY_FILE):
+        return False, f"找不到工厂清单文件：\n{FACTORY_FILE}"
+
+    # ── 1. 读工厂清单 ──
+    try:
+        plant_map, factory_debug = _build_plant_mapping(_log)
+    except Exception as e:
+        return False, f"读取工厂清单失败：\n{e}"
+
+    # ── 2. 打开 Sheet1 ──
     wb = openpyxl.load_workbook(EXCEL_FILE)
     ws = wb[SOURCE_SHEET]
 
-    # 扫描表头，定位各列
     headers = {}
     for c in range(1, ws.max_column + 1):
         v = ws.cell(1, c).value
         if v is not None:
             headers[str(v).strip()] = c
 
-    if "工厂" not in headers or "订单净值" not in headers:
+    if "工厂" not in headers:
         wb.close()
-        raise RuntimeError("Sheet1 缺少必需列：工厂 或 订单净值")
+        return False, "Sheet1 缺少必需列：工厂"
+    if "订单净值" not in headers:
+        wb.close()
+        return False, "Sheet1 缺少必需列：订单净值"
+
     factory_col = headers["工厂"]
     order_col = headers["订单净值"]
 
-    # ── 2. 在"订单净值"右侧插入"区域"和"分公司" ──
+    # ── 3. 插入/定位 区域、分公司 列 ──
     has_region = "区域" in headers
     has_branch = "分公司" in headers
+
     if not has_region and not has_branch:
         ws.insert_cols(order_col + 1, 2)
         region_col = order_col + 1
@@ -256,13 +322,7 @@ def _enhance_and_filter(plant_map, _log):
         ws.cell(1, region_col, "区域")
         _log("补插「区域」列")
 
-    # ── 诊断：打印 EXPORT1 工厂列前 5 个值 ──
-    debug_lines = ["[诊断] EXPORT1 工厂列前 5 个值:"]
-    for r in range(2, min(7, ws.max_row + 1)):
-        raw_val = ws.cell(r, factory_col).value
-        debug_lines.append(f"  行{r}: {repr(raw_val)}  → str.strip: {repr(str(raw_val or '').strip())}")
-
-    # ── 3. 填值 ──
+    # ── 4. 填值 ──
     matched, unmatched = 0, 0
     unmatched_samples = []
     for r in range(2, ws.max_row + 1):
@@ -276,33 +336,119 @@ def _enhance_and_filter(plant_map, _log):
             unmatched += 1
             if len(unmatched_samples) < 5:
                 unmatched_samples.append(repr(fv))
-    debug_lines.append(f"[诊断] 匹配成功: {matched}, 未匹配: {unmatched}")
-    if unmatched_samples:
-        debug_lines.append(f"[诊断] 未匹配样例: {unmatched_samples}")
+
     _log(f"区域/分公司匹配: 成功 {matched}, 未匹配 {unmatched}")
+
+    wb.save(EXCEL_FILE)
+    wb.close()
+
+    # ── 摘要 ──
+    summary = (
+        f"区域/分公司匹配完成！\n\n"
+        f"匹配成功：{matched} 行\n"
+        f"未匹配：{unmatched} 行\n"
+        f"工厂映射条目总数：{len(plant_map)}\n\n"
+        f"{factory_debug}"
+    )
+    if unmatched_samples:
+        summary += f"\n\n未匹配样例：{unmatched_samples[:5]}"
+
+    return True, summary
+
+
+# ═══════════════════ 数据增强 ═══════════════════
+
+def _enhance_and_filter(cfg, _log):
+    """
+    品类驱动的 Sheet1 增强 + 筛选流程：
+      1. 打开 Sheet1，定位「订单净值」列
+      2. 按品类配置在订单净值右侧插入列（cfg["insert_cols_after_order"]）
+      3. 在 Sheet1 末尾插入列（cfg["insert_col_at_end"]）
+      4. pandas 筛选物料 → 写入品类数据 Sheet
+    返回: (total_cols, total_rows) 筛选后数据的行列数（供 COM 透视表使用）
+    """
+    import openpyxl, pandas as pd
+
+    # ── 1. 打开原文件，找列位置 ──
+    wb = openpyxl.load_workbook(EXCEL_FILE)
+    ws = wb[SOURCE_SHEET]
+
+    # 扫描表头，定位各列
+    headers = {}
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(1, c).value
+        if v is not None:
+            headers[str(v).strip()] = c
+
+    if "订单净值" not in headers:
+        wb.close()
+        raise RuntimeError("Sheet1 缺少必需列：订单净值")
+    order_col = headers["订单净值"]
+
+    debug_lines = []
+    label = cfg["label"]
+
+    # ── 2. 品类差异化：在订单净值右侧插入列 ──
+    insert_cols = cfg["insert_cols_after_order"]
+    if insert_cols:
+        # 检查这些列是否已存在（可能上次运行已插入）
+        all_exist = all(c in headers for c in insert_cols)
+        if not all_exist:
+            # 在订单净值右边一次性插入所有列
+            ws.insert_cols(order_col + 1, len(insert_cols))
+            for i, col_name in enumerate(insert_cols):
+                ws.cell(1, order_col + 1 + i, col_name)
+            _log(f"[{label}] 已在「订单净值」右侧插入列：{', '.join(insert_cols)}")
+            # 刷新 headers（插入列后列号已变化）
+            headers = {}
+            for c in range(1, ws.max_column + 1):
+                v = ws.cell(1, c).value
+                if v is not None:
+                    headers[str(v).strip()] = c
+            order_col = headers["订单净值"]
+        else:
+            _log(f"[{label}] 列 {', '.join(insert_cols)} 已存在，跳过插入")
+
+    # ── 3. 在 Sheet1 末尾插入列 ──
+    end_col_name = cfg["insert_col_at_end"]
+    if end_col_name:
+        # 刷新 headers（前面的插入可能改变了列数）
+        headers = {}
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(1, c).value
+            if v is not None:
+                headers[str(v).strip()] = c
+        if end_col_name not in headers:
+            last_col = ws.max_column
+            ws.cell(1, last_col + 1, end_col_name)
+            _log(f"[{label}] 已在 Sheet1 末尾插入「{end_col_name}」列")
+        else:
+            _log(f"[{label}] 列「{end_col_name}」已存在，跳过插入")
 
     debug_str = "\n".join(debug_lines)
 
     wb.save(EXCEL_FILE)
     wb.close()
 
-    # ── 4. pandas 读增强后数据 → 筛选 → 写入「装潢数据」Sheet ──
-    _log("正在筛选物料...")
+    # ── 4. pandas 读增强后数据 → 筛选 → 写入品类数据 Sheet ──
+    filter_materials = cfg["filter_materials"]
+    data_sheet = cfg["data_sheet"]
+    _log(f"[{label}] 正在筛选物料 {filter_materials}...")
     df_all = pd.read_excel(EXCEL_FILE, sheet_name=SOURCE_SHEET)
     # 确保物料列为数值类型用于比较
     df_all["物料"] = pd.to_numeric(df_all["物料"], errors="coerce")
-    df_filtered = df_all[df_all["物料"].isin(FILTER_MATERIALS)].copy()
+    df_filtered = df_all[df_all["物料"].isin(filter_materials)].copy()
     df_filtered = df_filtered.reset_index(drop=True)
 
     if len(df_filtered) == 0:
-        raise RuntimeError(f"筛选后无数据！物料 {FILTER_MATERIALS} 在数据中不存在。")
-    _log(f"筛选后数据行数: {len(df_filtered)}")
+        raise RuntimeError(f"[{label}] 筛选后无数据！物料 {filter_materials} 在数据中不存在。")
+    _log(f"[{label}] 筛选后数据行数: {len(df_filtered)}")
 
-    # 写入「装潢数据」Sheet
+    # 写入品类数据 Sheet
     wb2 = openpyxl.load_workbook(EXCEL_FILE)
-    if DATA_SHEET in wb2.sheetnames:
-        del wb2[DATA_SHEET]
-    ds = wb2.create_sheet(title=DATA_SHEET)
+    if data_sheet in wb2.sheetnames:
+        del wb2[data_sheet]
+    ds = wb2.create_sheet(title=data_sheet)
     # 写表头
     for ci, col_name in enumerate(df_filtered.columns, 1):
         ds.cell(1, ci, col_name)
@@ -318,22 +464,26 @@ def _enhance_and_filter(plant_map, _log):
 
 # ═══════════════════ 扩展列 ═══════════════════
 
-def add_extra_columns():
+def add_extra_columns(category=None):
     """
-    在「装潢透视表」Sheet 中，透视表右侧追加 EXTRA_COLUMNS 表头。
+    在透视表 Sheet 中，透视表右侧追加 EXTRA_COLUMNS 表头。
     重复调用会自动更新列名（旧列名自动替换为新列名，已有数据不丢失）。
     """
     import openpyxl
+
+    cfg = _cfg(category)
+    target_sheet = cfg["target_sheet"]
+    label = cfg["label"]
 
     if not os.path.exists(EXCEL_FILE):
         return False, f"找不到文件：\n{EXCEL_FILE}"
 
     wb = openpyxl.load_workbook(EXCEL_FILE)
-    if TARGET_SHEET not in wb.sheetnames:
+    if target_sheet not in wb.sheetnames:
         wb.close()
-        return False, f"Sheet \"{TARGET_SHEET}\" 不存在，请先生成透视表。"
+        return False, f"Sheet \"{target_sheet}\" 不存在，请先生成透视表。"
 
-    ws = wb[TARGET_SHEET]
+    ws = wb[target_sheet]
 
     # 找到第 1 行最右侧已用列
     max_col = ws.max_column
@@ -345,7 +495,7 @@ def add_extra_columns():
 
     if last_used == 0:
         wb.close()
-        return False, f"Sheet \"{TARGET_SHEET}\" 第 1 行为空，无法定位。"
+        return False, f"Sheet \"{target_sheet}\" 第 1 行为空，无法定位。"
 
     # 定位扩展列起始列：优先找已有「E2E项目名」，否则从 last_used + 1 开始
     start_col = None
@@ -371,7 +521,7 @@ def add_extra_columns():
 
     col_range = f"{_col_letter(start_col)}~{_col_letter(start_col + len(EXTRA_COLUMNS) - 1)}"
     action = f"更新了 {updated} 个列名" if updated > 0 else "列名已是最新，无需更新"
-    return True, f"已在「{TARGET_SHEET}」透视表右侧配置 {len(EXTRA_COLUMNS)} 个扩展列表头。\n列范围：{col_range}\n{action}\n列名：{', '.join(EXTRA_COLUMNS)}"
+    return True, f"已在「{target_sheet}」透视表右侧配置 {len(EXTRA_COLUMNS)} 个扩展列表头。\n列范围：{col_range}\n{action}\n列名：{', '.join(EXTRA_COLUMNS)}"
 
 
 # ═══════════════════ NI PM Saving Tracking 匹配 ═══════════════════
@@ -379,6 +529,9 @@ def add_extra_columns():
 TRACKING_FILE = os.path.join(SCRIPT_DIR, "NI PM Saving Tracking.xlsx")
 TRACKING_SHEET = "Base Data"
 TRACKING_PROJECT_COL = "Project Name"
+SUPPORT_FILE_NAME_COL = "支持文件名(FLD 审批)"
+APPROVAL_AMOUNT_COL = "项目总金额(审批)"
+PRICE_APPROVAL_TOLERANCE = 0.01
 FUZZY_MATCH_THRESHOLD = 0.6  # n-gram 相似度阈值，精确子串匹配失败时启用
 
 
@@ -396,19 +549,39 @@ def _ngram_similarity(s1, s2, n=2):
     return len(intersection) / min(len(ng1), len(ng2))
 
 
-def match_pm_tracking_data():
+def _as_number(value):
+    """将金额单元格转换为数值；空白或非数值返回 None，供人工复核提示使用。"""
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def match_pm_tracking_data(category=None):
     """
-    读取「装潢透视表」中的 E2E项目名，去 NI PM Saving Tracking.xlsx
+    读取透视表中的 E2E项目名，去 NI PM Saving Tracking.xlsx
     的 Base Data Sheet 的 Project Name 列中做模糊匹配（包含即匹配）。
 
     匹配成功：从 Tracking 提取 Price/PlanCost，读取透视表订单净值，
-    计算总saving（= 订单净值 × PlanCost ÷ Price）和 SAVING差异（= 总saving - 订单净值），
+    计算总saving（= 订单净值 × PlanCost ÷ Price）和 订单是否下完（= Price - 订单净值），
     写入透视表对应列。Price 为 0 或空时填入 "N/A"。
     未匹配：跳过不写。
 
     返回: (success: bool, message: str)
     """
     import openpyxl
+
+    cfg = _cfg(category)
+    target_sheet = cfg["target_sheet"]
+    content_filter = cfg["content_filter"]
+    content_filter_values = tuple(cfg.get("content_filter_values", (content_filter,)))
+    label = cfg["label"]
+    requires_fld_support_file = cfg.get("requires_fld_support_file", False)
+    content_filter_exact_on_multiple_matches = cfg.get(
+        "content_filter_exact_on_multiple_matches", False
+    )
 
     if not os.path.exists(EXCEL_FILE):
         return False, f"找不到文件：\n{EXCEL_FILE}"
@@ -417,11 +590,11 @@ def match_pm_tracking_data():
 
     # ── 1. 打开透视表，扫描第1行定位各列 ──
     wb = openpyxl.load_workbook(EXCEL_FILE)
-    if TARGET_SHEET not in wb.sheetnames:
+    if target_sheet not in wb.sheetnames:
         wb.close()
-        return False, f"Sheet「{TARGET_SHEET}」不存在，请先生成透视表。"
+        return False, f"Sheet「{target_sheet}」不存在，请先生成透视表。"
 
-    ws = wb[TARGET_SHEET]
+    ws = wb[target_sheet]
 
     e2e_col = None
     order_value_col = None   # 订单净值（列B "求和项:订单净值"）
@@ -430,6 +603,8 @@ def match_pm_tracking_data():
     plancost_col = None
     total_saving_col = None
     saving_diff_col = None
+    support_file_col = None
+    approval_amount_col = None
 
     for col in range(1, ws.max_column + 1):
         val = str(ws.cell(1, col).value or "").strip()
@@ -445,29 +620,50 @@ def match_pm_tracking_data():
             plancost_col = col
         elif val == "总saving":
             total_saving_col = col
-        elif val == "SAVING差异":
+        elif val == "订单是否下完=price-订单净值":
             saving_diff_col = col
+        elif val == SUPPORT_FILE_NAME_COL:
+            support_file_col = col
+        elif val == APPROVAL_AMOUNT_COL:
+            approval_amount_col = col
 
     if e2e_col is None:
         wb.close()
-        return False, f"「{TARGET_SHEET}」中未找到「E2E项目名」列，请先点击「添加扩展列」按钮。"
+        return False, f"「{target_sheet}」中未找到「E2E项目名」列，请先点击「添加扩展列」按钮。"
     if order_value_col is None:
         wb.close()
-        return False, f"「{TARGET_SHEET}」中未找到「求和项:订单净值」列，透视表可能未正确生成。"
+        return False, f"「{target_sheet}」中未找到「求和项:订单净值」列，透视表可能未正确生成。"
     if price_col is None or plancost_col is None or total_saving_col is None or saving_diff_col is None:
         wb.close()
         return False, (
-            f"「{TARGET_SHEET}」中缺少扩展列（Price/PlanCost/总saving/SAVING差异），"
+            f"「{target_sheet}」中缺少扩展列（Price/PlanCost/总saving/订单是否下完=price-订单净值），"
             f"请先点击「添加扩展列」按钮。"
         )
+    if approval_amount_col is None:
+        wb.close()
+        return False, (
+            f"「{target_sheet}」中未找到「{APPROVAL_AMOUNT_COL}」列，"
+            "请先点击「添加扩展列」按钮。"
+        )
+    if requires_fld_support_file and support_file_col is None:
+        wb.close()
+        return False, (
+            f"「{target_sheet}」中未找到「{SUPPORT_FILE_NAME_COL}」列，"
+            "请先完成附件回填。"
+        )
 
-    # ── 2. 收集所有 E2E项目名和采购凭证（跳过空值）──
+    # ── 2. 收集待匹配的 E2E项目名和采购凭证（跳过空值）──
     project_names = []  # (row_number, project_name, po_number)
     for row in range(2, ws.max_row + 1):
         val = str(ws.cell(row, e2e_col).value or "").strip()
-        if val:
-            po_val = str(ws.cell(row, po_col).value or "").strip() if po_col else ""
-            project_names.append((row, val, po_val))
+        if not val:
+            continue
+        if requires_fld_support_file:
+            support_file_name = str(ws.cell(row, support_file_col).value or "").strip()
+            if not support_file_name:
+                continue
+        po_val = str(ws.cell(row, po_col).value or "").strip() if po_col else ""
+        project_names.append((row, val, po_val))
 
     if not project_names:
         wb.close()
@@ -526,6 +722,8 @@ def match_pm_tracking_data():
         missing_track.append("Price")
     if track_plancost_col is None:
         missing_track.append("PlanCost")
+    if track_content_col is None:
+        missing_track.append("Content")
     if missing_track:
         headers_str = _tracking_headers()
         wb_track.close()
@@ -560,6 +758,19 @@ def match_pm_tracking_data():
 
     wb_track.close()
 
+    # Content 是品类边界，不是同名项目出现多行时才使用的附加条件。
+    # 必须先限定到当前自动化的品类，再做项目名精确/模糊匹配；否则长项目名
+    # 可能因包含了一个装潢短名称而把装潢 Price 错写入空调透视表。
+    def _matches_current_category(t_content):
+        if content_filter_exact_on_multiple_matches:
+            return t_content in content_filter_values
+        return t_content.startswith(content_filter)
+
+    category_tracking_rows = [
+        track_row for track_row in tracking_rows
+        if _matches_current_category(track_row[3])
+    ]
+
     # ── 4. 逐行匹配 + 写入 ──
     matched = 0
     written = 0
@@ -567,17 +778,19 @@ def match_pm_tracking_data():
     unmatched_samples = []
     na_count = 0
     fuzzy_match_count = 0
-    zhuanghuang_multi_count = 0
-    zhuanghuang_multi_list = []
+    content_multi_count = 0
+    content_multi_list = []
     other_multi_count = 0
     other_multi_list = []
+    amount_mismatch_list = []
+    amount_uncomparable_list = []
 
     for row_num, pn, po_num in project_names:
         pn_lower = pn.lower()
 
         # 第一轮：精确子串匹配
         all_matches = []
-        for t_pn, t_price, t_plancost, t_content in tracking_rows:
+        for t_pn, t_price, t_plancost, t_content in category_tracking_rows:
             if pn_lower in t_pn:  # t_pn 已在收集时预计算为小写
                 all_matches.append((t_pn, t_price, t_plancost, t_content))
 
@@ -586,7 +799,7 @@ def match_pm_tracking_data():
         if not all_matches:
             best_score = 0.0
             best_match = None
-            for t_pn, t_price, t_plancost, t_content in tracking_rows:
+            for t_pn, t_price, t_plancost, t_content in category_tracking_rows:
                 score = _ngram_similarity(pn_lower, t_pn)
                 if score > best_score:
                     best_score = score
@@ -595,29 +808,19 @@ def match_pm_tracking_data():
                 all_matches = [best_match]
                 is_fuzzy = True
 
-        # 筛选 Content 以"装潢"开头的行
-        zhuanghuang_matches = [m for m in all_matches if m[3].startswith("装潢")]
-
         found_track = None
-        if zhuanghuang_matches:
-            if len(zhuanghuang_matches) > 1:
-                # 多行装潢匹配 → 跳过并记录
-                zhuanghuang_multi_count += 1
-                zhuanghuang_multi_list.append((po_num, pn))
-                continue
-            found_track = zhuanghuang_matches[0]
-        elif all_matches:
-            if len(all_matches) > 1:
-                # 无装潢行，但多行非装潢匹配 → 跳过并记录
-                other_multi_count += 1
-                other_multi_list.append((po_num, pn))
-                continue
+        if len(all_matches) == 1:
             found_track = all_matches[0]
+        elif len(all_matches) > 1:
+            # 候选已通过当前品类的 Content 过滤；仍有多行时属于业务歧义，
+            # 不猜测、不写入，交由人工确认。
+            content_multi_count += 1
+            content_multi_list.append((po_num, pn))
+            continue
 
         if found_track is None:
             unmatched += 1
-            if len(unmatched_samples) < 5:
-                unmatched_samples.append(pn)
+            unmatched_samples.append((po_num, pn))
             continue
 
         matched += 1
@@ -646,82 +849,651 @@ def match_pm_tracking_data():
         ws.cell(row_num, price_col, t_price)
         ws.cell(row_num, plancost_col, t_plancost)
 
-        # 计算总saving 和 SAVING差异
+        # 计算总saving 和 订单是否下完
         if price_num == 0:
             ws.cell(row_num, total_saving_col, "N/A")
             ws.cell(row_num, saving_diff_col, "N/A")
             na_count += 1
         else:
             total_saving = order_num * plancost_num / price_num
-            saving_diff = total_saving - order_num
+            saving_diff = price_num - order_num
             ws.cell(row_num, total_saving_col, round(total_saving, 2))
             ws.cell(row_num, saving_diff_col, round(saving_diff, 2))
             written += 1
+
+        # PM 匹配完成后，以透视表最终写入的 Price 对比项目总金额（审批）。
+        # 不一致或任一金额为空/非数值都仅记录；全部项目处理完后统一提示人工。
+        written_price = ws.cell(row_num, price_col).value
+        approval_amount = ws.cell(row_num, approval_amount_col).value
+        price_for_check = _as_number(written_price)
+        approval_for_check = _as_number(approval_amount)
+        if price_for_check is None or approval_for_check is None:
+            amount_uncomparable_list.append((po_num, pn, written_price, approval_amount))
+        else:
+            raw_amount_difference = price_for_check - approval_for_check
+            if abs(raw_amount_difference) > PRICE_APPROVAL_TOLERANCE:
+                amount_mismatch_list.append(
+                    (
+                        po_num,
+                        pn,
+                        written_price,
+                        approval_amount,
+                        round(raw_amount_difference, 2),
+                    )
+                )
 
     # ── 5. 保存 ──
     wb.save(EXCEL_FILE)
     wb.close()
 
     # ── 6. 返回摘要 ──
+    sep = "─" * 42
     summary_lines = [
-        f"NI PM Saving Tracking 匹配完成！",
+        f"{sep}",
+        f"  PM Tracking 匹配报告",
+        f"{sep}",
         f"",
-        f"待匹配项目名总数：{len(project_names)}",
-        f"匹配成功：{matched}（已写入 Price/PlanCost/总saving/SAVING差异: {written}）",
-        f"未匹配（跳过）：{unmatched}",
+        f"  待匹配项目总数：{len(project_names)}",
+        f"",
     ]
+
+    # ✅ 成功
+    skipped_total = content_multi_count + other_multi_count
+    summary_lines.append(f"  ✅ 匹配成功：{matched} 个（Price/PlanCost/总saving/订单是否下完 已写入）")
     if fuzzy_match_count > 0:
-        summary_lines.append(f"其中模糊匹配（n-gram 兜底）：{fuzzy_match_count}")
+        summary_lines.append(f"     其中模糊匹配（n-gram 兜底）：{fuzzy_match_count} 个")
     if na_count > 0:
-        summary_lines.append(f"Price 为 0/空（填入 N/A）：{na_count}")
-    if zhuanghuang_multi_count > 0:
-        summary_lines.extend([
-            f"",
-            f"跳过多行装潢匹配（{zhuanghuang_multi_count} 个）：",
-        ])
-        for po, pn in zhuanghuang_multi_list:
-            summary_lines.append(f"  · PO {po} — {pn}（装潢匹配到多行，无法确定唯一行）")
+        summary_lines.append(f"     Price 为 0/空（填入 N/A）：{na_count} 个")
+
+    if amount_mismatch_list:
+        summary_lines.append("")
+        summary_lines.append(
+            f"  ⚠ Price 与{APPROVAL_AMOUNT_COL}不一致（需人工介入）："
+            f"{len(amount_mismatch_list)} 个（允许误差 ±{PRICE_APPROVAL_TOLERANCE:.2f}）"
+        )
+        for po, pn, price, approval, difference in amount_mismatch_list:
+            summary_lines.append(
+                f"     · PO {po} — {pn[:40]} | Price={price} | 审批={approval} | 差额={difference}"
+            )
+
+    if amount_uncomparable_list:
+        summary_lines.append("")
+        summary_lines.append(
+            f"  ⚠ Price 与{APPROVAL_AMOUNT_COL}无法比较（需人工确认）："
+            f"{len(amount_uncomparable_list)} 个"
+        )
+        for po, pn, price, approval in amount_uncomparable_list:
+            summary_lines.append(
+                f"     · PO {po} — {pn[:40]} | Price={price} | 审批={approval}"
+            )
+
+    # ⚠ 跳过
+    if skipped_total > 0:
+        summary_lines.append(f"")
+        summary_lines.append(f"  ⚠ 跳过（需人工确认）：{skipped_total} 个")
+    if content_multi_count > 0:
+        for po, pn in content_multi_list:
+            summary_lines.append(f"     · PO {po} — {pn[:40]}")
+            summary_lines.append(
+                f"       原因：Content 列「{' / '.join(content_filter_values)}」匹配到多行"
+            )
     if other_multi_count > 0:
-        summary_lines.extend([
-            f"",
-            f"跳过多行非装潢匹配（{other_multi_count} 个）：",
-        ])
         for po, pn in other_multi_list:
-            summary_lines.append(f"  · PO {po} — {pn}（匹配到多行且均非装潢，无法确定唯一行）")
+            summary_lines.append(f"     · PO {po} — {pn[:40]}")
+            summary_lines.append(f"       原因：匹配到多行且均非{label}")
+
+    # ❌ 未匹配
+    if unmatched > 0:
+        summary_lines.append(f"")
+        summary_lines.append(f"  ❌ 未匹配（共 {unmatched} 个）：")
+        for po, pn in unmatched_samples:
+            summary_lines.append(f"     · PO {po}  —  {pn[:50]}")
+
+    # 底部文件信息
     summary_lines.extend([
         f"",
-        f"Tracking 文件总行数：{len(tracking_rows)}",
-        f"Sheet：{TRACKING_SHEET}，匹配列：{TRACKING_PROJECT_COL}",
+        f"{sep}",
+        f"  Tracking：{os.path.basename(TRACKING_FILE)}",
+        f"  Sheet：{TRACKING_SHEET}  |  匹配列：{TRACKING_PROJECT_COL}  |  总行数：{len(tracking_rows)}",
+        f"{sep}",
     ])
-    if unmatched_samples:
-        summary_lines.append(f"")
-        summary_lines.append(f"未匹配样例（前 5 个）：")
-        for s in unmatched_samples:
-            summary_lines.append(f"  - {s}")
 
-    return True, "\n".join(summary_lines)
+    summary_text = "\n".join(summary_lines)
+
+    # ── 写入 txt 文件（方便复制分享）──
+    report_path = os.path.join(SCRIPT_DIR, "PM匹配报告.txt")
+    try:
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(summary_text)
+    except Exception:
+        pass
+
+    return True, summary_text
 
 
 # ═══════════════════ 主流程 ═══════════════════
 
-def generate_pivot_table(status_callback=None):
+AIR_PRICE_LIST_SHEET = "AC 25.10降价"
+AIR_PRICE_INSTALLATION_TEXT = "安装调试费（含辅料）"
+
+
+def fill_air_conditioning_old_new_prices(price_file, status_callback=None):
+    """填充空调价格，并用有 FLD 的 PO 汇总值覆盖其全部明细行。
+
+    常规项目仅接受“短文本 = SAP Discription-Ner”的精确匹配；这是为了
+    避免名称相近时把价格写到错误物料。仅“安装调试费（含辅料）”可回退到
+    Discription，因为该名称在实际台账中未规范写入 SAP 字段；回退结果的
+    全部老/新价格必须一致，否则保留为空供人工确认。
+
+    价格表是无 FLD 明细的基础价格。对于已在空调透视表完成 PM Tracking
+    的 FLD PO，整组明细统一改为：老价格 = 总saving，新价格 = 订单净值，
+    Saving = 老价格 - 新价格。无 FLD 的明细则按（老价格 - 净价）× 采购
+    订单数量计算 Saving。最后逐行计算 CHECK = 新价格 - 净价；差额为零时
+    明确写入数值 0，而不是保留空白。计算所需值缺失时不猜测，保留原值。
+    重复执行时，已同时具有老价格和新价格的无 FLD 行视为已完成，四个结果
+    列均保持不变；有 FLD 的 PO 仍按最新透视表数据刷新。
     """
-    完整工作流：
-      1. 读工厂清单 → 建 Plant→(区域,分公司) 映射
-      2. openpyxl 增强 Sheet1（插入区域/分公司列，按工厂填值，保留格式）
-      3. pandas 筛选 物料=1000027307/1000027308 → 写入「装潢数据」Sheet
-      4. COM 生成原生透视表 → 「装潢透视表」（Sheet1 右侧）
+    import math
+    import openpyxl
+
+    def _status(message):
+        if status_callback:
+            status_callback(message)
+
+    def _normalise(value):
+        return str(value or "").strip()
+
+    def _is_blank(value):
+        return value is None or str(value).strip() == ""
+
+    def _normalise_po(value):
+        """消除 Excel 将整数 PO 读成浮点数时产生的 .0。"""
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return _normalise(value)
+
+    def _consistent_price_pair(candidates):
+        """同一备用描述允许多行，但它们的老/新价格必须完全一致。"""
+        pairs = {(candidate[0], candidate[1]) for candidate in candidates}
+        if len(pairs) != 1:
+            return None
+        old_price, new_price = next(iter(pairs))
+        if old_price is None or new_price is None:
+            return None
+        return old_price, new_price
+
+    def _merged_anchor(worksheet_to_read, row_number, column_number):
+        """返回单元格所在合并区域的左上角，普通单元格返回自身。"""
+        for merged_range in worksheet_to_read.merged_cells.ranges:
+            if (
+                merged_range.min_row <= row_number <= merged_range.max_row
+                and merged_range.min_col <= column_number <= merged_range.max_col
+            ):
+                return merged_range.min_row, merged_range.min_col
+        return row_number, column_number
+
+    def _read_merged_value(worksheet_to_read, row_number, column_number):
+        anchor_row, anchor_col = _merged_anchor(
+            worksheet_to_read, row_number, column_number
+        )
+        return worksheet_to_read.cell(anchor_row, anchor_col).value
+
+    def _write_merged_value(worksheet_to_write, row_number, column_number, value):
+        """尊重用户已有的合并格式；合并区域只写入其可编辑的左上角。"""
+        anchor_row, anchor_col = _merged_anchor(
+            worksheet_to_write, row_number, column_number
+        )
+        worksheet_to_write.cell(anchor_row, anchor_col, value)
+
+    def _contiguous_row_groups(row_numbers):
+        """将同一 PO 的行拆成连续区间，绝不跨越其他 PO 合并单元格。"""
+        groups = []
+        for row_number in sorted(set(row_numbers)):
+            if not groups or row_number != groups[-1][-1] + 1:
+                groups.append([row_number])
+            else:
+                groups[-1].append(row_number)
+        return groups
+
+    def _merge_fld_display_group(worksheet_to_write, po_number, row_numbers, columns):
+        """将一个连续 FLD PO 区间的汇总列合并为可点击的一组展示。"""
+        if len(row_numbers) < 2:
+            return 0
+
+        from openpyxl.styles import Alignment, PatternFill
+
+        first_row = row_numbers[0]
+        last_row = row_numbers[-1]
+        fill = PatternFill(fill_type="solid", fgColor="FFF2CC")
+        alignment = Alignment(horizontal="center", vertical="center")
+        ranges_to_unmerge = []
+
+        for column_number in columns:
+            overlapping_ranges = [
+                merged_range
+                for merged_range in worksheet_to_write.merged_cells.ranges
+                if (
+                    merged_range.min_col == merged_range.max_col == column_number
+                    and merged_range.min_row <= last_row
+                    and merged_range.max_row >= first_row
+                )
+            ]
+            for merged_range in overlapping_ranges:
+                # 只撤销同一 PO 已有的汇总列合并，避免误伤用户手工制作的其他区域。
+                merged_pos = {
+                    _normalise_po(
+                        worksheet_to_write.cell(row, po_col).value
+                    )
+                    for row in range(merged_range.min_row, merged_range.max_row + 1)
+                }
+                if merged_pos == {po_number}:
+                    ranges_to_unmerge.append(merged_range)
+                else:
+                    return 0
+
+        # 三列均确认安全后才解除旧合并，避免其中一列冲突时留下半完成状态。
+        for merged_range in ranges_to_unmerge:
+            worksheet_to_write.unmerge_cells(str(merged_range))
+
+        for column_number in columns:
+            for row_number in row_numbers:
+                cell = worksheet_to_write.cell(row_number, column_number)
+                cell.fill = fill
+                cell.alignment = alignment
+            worksheet_to_write.merge_cells(
+                start_row=first_row,
+                start_column=column_number,
+                end_row=last_row,
+                end_column=column_number,
+            )
+        return 1
+
+    def _number(value):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    if not os.path.exists(EXCEL_FILE):
+        return False, f"找不到采购记录文件：\n{EXCEL_FILE}"
+    if not price_file or not os.path.isfile(price_file):
+        return False, f"找不到空调价格表：\n{price_file or '未选择文件'}"
+
+    _status("正在读取空调价格表并建立精确匹配索引...")
+    try:
+        price_book = openpyxl.load_workbook(price_file, read_only=True, data_only=True)
+    except Exception as exc:
+        return False, f"无法打开空调价格表：\n{exc}"
+
+    if AIR_PRICE_LIST_SHEET not in price_book.sheetnames:
+        available = "、".join(price_book.sheetnames)
+        price_book.close()
+        return False, (
+            f"价格表中未找到 Sheet「{AIR_PRICE_LIST_SHEET}」。\n"
+            f"当前可用 Sheet：{available}"
+        )
+
+    price_by_sap_description = {}
+    price_by_description = {}
+    try:
+        price_sheet = price_book[AIR_PRICE_LIST_SHEET]
+        for row in price_sheet.iter_rows(min_row=2, values_only=True):
+            if len(row) < 10:
+                continue
+            pair = (row[7], row[9])  # H=老价格，J=新价格
+            sap_description = _normalise(row[4])  # E=SAP Discription-Ner
+            description = _normalise(row[5])      # F=Discription
+            if sap_description:
+                price_by_sap_description.setdefault(sap_description, []).append(pair)
+            if description:
+                price_by_description.setdefault(description, []).append(pair)
+    finally:
+        price_book.close()
+
+    try:
+        workbook = openpyxl.load_workbook(EXCEL_FILE)
+    except Exception as exc:
+        return False, f"无法打开采购记录文件：\n{exc}"
+
+    air_cfg = CATEGORIES["空调"]
+    air_data_sheet = air_cfg["data_sheet"]
+    air_pivot_sheet = air_cfg["target_sheet"]
+    if air_data_sheet not in workbook.sheetnames:
+        workbook.close()
+        return False, f"采购记录中未找到 Sheet「{air_data_sheet}」。"
+    if air_pivot_sheet not in workbook.sheetnames:
+        workbook.close()
+        return False, (
+            f"采购记录中未找到 Sheet「{air_pivot_sheet}」。\n"
+            "请先生成透视表、完成附件回填和 PM Tracking 匹配后，再执行第⑥步。"
+        )
+
+    worksheet = workbook[air_data_sheet]
+    headers = {
+        _normalise(worksheet.cell(1, column).value): column
+        for column in range(1, worksheet.max_column + 1)
+        if _normalise(worksheet.cell(1, column).value)
+    }
+    required_headers = (
+        "采购凭证", "短文本", "老价格", "新价格", "Saving", "CHECK", "净价", "采购订单数量",
+    )
+    missing_headers = [header for header in required_headers if header not in headers]
+    if missing_headers:
+        workbook.close()
+        return False, f"「{air_data_sheet}」缺少列：{', '.join(missing_headers)}。"
+
+    po_col = headers["采购凭证"]
+    short_text_col = headers["短文本"]
+    old_price_col = headers["老价格"]
+    new_price_col = headers["新价格"]
+    saving_col = headers["Saving"]
+    check_col = headers["CHECK"]
+    net_price_col = headers["净价"]
+    purchase_order_quantity_col = headers["采购订单数量"]
+
+    pivot_worksheet = workbook[air_pivot_sheet]
+    pivot_headers = {
+        _normalise(pivot_worksheet.cell(1, column).value): column
+        for column in range(1, pivot_worksheet.max_column + 1)
+        if _normalise(pivot_worksheet.cell(1, column).value)
+    }
+    pivot_order_value_col = pivot_headers.get("求和项:订单净值")
+    pivot_total_saving_col = pivot_headers.get("总saving")
+    pivot_po_columns = [
+        column for column in (
+            pivot_headers.get("采购凭证"),
+            pivot_headers.get("行标签"),
+        ) if column is not None
+    ]
+    if pivot_order_value_col is None or pivot_total_saving_col is None:
+        workbook.close()
+        return False, (
+            f"「{air_pivot_sheet}」缺少「求和项:订单净值」或「总saving」列。\n"
+            "请先完成附件回填和 PM Tracking 匹配后，再执行第⑥步。"
+        )
+    if not pivot_po_columns:
+        workbook.close()
+        return False, (
+            f"「{air_pivot_sheet}」未找到「采购凭证」或「行标签」列，"
+            "无法定位 FLD PO。"
+        )
+
+    po_to_rows = {}
+    for row_number in range(2, worksheet.max_row + 1):
+        po_number = _normalise_po(worksheet.cell(row_number, po_col).value)
+        if po_number:
+            po_to_rows.setdefault(po_number, []).append(row_number)
+
+    # 第五列允许记录任意支持文件名，不能再把“非空”当成 FLD 标志。
+    # 复用网页下载模块的文件名规则，同时扫描两个历史分类目录中的实际文件。
+    try:
+        import web_query
+        classify_downloaded_po = web_query.classify_downloaded_po_attachments
+    except (ImportError, AttributeError) as exc:
+        workbook.close()
+        return False, f"无法加载附件分类逻辑：\n{exc}"
+
+    fld_pos_seen = set()
+    no_fld_pos_seen = set()
+    download_missing_pos = set()
+    download_scan_error_pos = set()
+    download_scan_errors = {}
+    for po_number in po_to_rows:
+        classification = classify_downloaded_po(
+            po_number,
+            category_label="空调",
+            download_dir=DOWNLOAD_DIR,
+        )
+        status = classification.get("status")
+        if status == "fld":
+            fld_pos_seen.add(po_number)
+        elif status == "non_fld":
+            no_fld_pos_seen.add(po_number)
+        elif status == "missing":
+            download_missing_pos.add(po_number)
+        else:
+            download_scan_error_pos.add(po_number)
+            download_scan_errors[po_number] = classification.get("errors") or []
+
+    unclassified_download_pos = download_missing_pos | download_scan_error_pos
+
+    # 原生透视表有两种布局：表格形式用“采购凭证”列，紧凑形式将层级值放在“行标签”列。
+    # 只接受能在空调数据中找到的 PO，避免把区域、分公司、供应商名称误识别为采购凭证。
+    fld_pivot_values = {}
+    ambiguous_fld_pos = set()
+    for row_number in range(2, pivot_worksheet.max_row + 1):
+        po_number = ""
+        for candidate_col in pivot_po_columns:
+            candidate = _normalise_po(
+                _read_merged_value(pivot_worksheet, row_number, candidate_col)
+            )
+            if candidate in po_to_rows:
+                po_number = candidate
+                break
+        if not po_number or po_number not in fld_pos_seen:
+            continue
+
+        old_value = _read_merged_value(pivot_worksheet, row_number, pivot_total_saving_col)
+        new_value = _read_merged_value(pivot_worksheet, row_number, pivot_order_value_col)
+        old_number = _number(old_value)
+        new_number = _number(new_value)
+        if old_number is None or new_number is None:
+            continue
+
+        existing = fld_pivot_values.get(po_number)
+        if existing and (existing[2], existing[3]) != (old_number, new_number):
+            ambiguous_fld_pos.add(po_number)
+            continue
+        fld_pivot_values[po_number] = (old_value, new_value, old_number, new_number)
+
+    for po_number in ambiguous_fld_pos:
+        fld_pivot_values.pop(po_number, None)
+    invalid_fld_pos = fld_pos_seen - set(fld_pivot_values) - ambiguous_fld_pos
+
+    # 保护已经完成过按钮⑥的无 FLD 行。首次执行时老/新价格为空，仍会正常
+    # 匹配、计算；以后两列均已有值时，不再覆盖老价格、新价格、Saving、CHECK。
+    # 如果该 PO 后续被识别为有 FLD，则不进入保护集，仍按最新透视表刷新。
+    protected_non_fld_rows = set()
+    for row_number in range(2, worksheet.max_row + 1):
+        po_number = _normalise_po(worksheet.cell(row_number, po_col).value)
+        if po_number not in no_fld_pos_seen:
+            continue
+        old_price = _read_merged_value(worksheet, row_number, old_price_col)
+        new_price = _read_merged_value(worksheet, row_number, new_price_col)
+        if not _is_blank(old_price) and not _is_blank(new_price):
+            protected_non_fld_rows.add(row_number)
+
+    primary_matches = 0
+    installation_fallback_matches = 0
+    unmatched_texts = set()
+    ambiguous_texts = set()
+
+    _status("正在填充空调基础价格，随后计算 FLD 覆盖与 CHECK...")
+    for row_number in range(2, worksheet.max_row + 1):
+        po_number = _normalise_po(worksheet.cell(row_number, po_col).value)
+        if not po_number or po_number in unclassified_download_pos:
+            continue
+        if row_number in protected_non_fld_rows:
+            continue
+        short_text = _normalise(worksheet.cell(row_number, short_text_col).value)
+        if not short_text:
+            continue
+
+        primary_candidates = price_by_sap_description.get(short_text, [])
+        price_pair = _consistent_price_pair(primary_candidates)
+        if price_pair is not None:
+            primary_matches += 1
+        elif primary_candidates:
+            ambiguous_texts.add(short_text)
+            continue
+        elif short_text == AIR_PRICE_INSTALLATION_TEXT:
+            # 这是唯一经业务确认的非标准名称回退，不能扩展为模糊匹配。
+            fallback_candidates = price_by_description.get(short_text, [])
+            price_pair = _consistent_price_pair(fallback_candidates)
+            if price_pair is not None:
+                installation_fallback_matches += 1
+            elif fallback_candidates:
+                ambiguous_texts.add(short_text)
+                continue
+            else:
+                unmatched_texts.add(short_text)
+                continue
+        else:
+            unmatched_texts.add(short_text)
+            continue
+
+        _write_merged_value(worksheet, row_number, old_price_col, price_pair[0])
+        _write_merged_value(worksheet, row_number, new_price_col, price_pair[1])
+
+    _status("正在用空调透视表中的 FLD PO 汇总值覆盖全部对应明细...")
+    fld_override_rows = 0
+    for po_number, (old_value, new_value, old_number, new_number) in fld_pivot_values.items():
+        saving_value = round(old_number - new_number, 2)
+        for row_number in po_to_rows[po_number]:
+            _write_merged_value(worksheet, row_number, old_price_col, old_value)
+            _write_merged_value(worksheet, row_number, new_price_col, new_value)
+            _write_merged_value(worksheet, row_number, saving_col, saving_value)
+            fld_override_rows += 1
+
+    _status("正在计算无 FLD 明细的 Saving（老价格 - 净价）× 采购订单数量...")
+    non_fld_saving_written = 0
+    non_fld_saving_skipped = 0
+    for row_number in range(2, worksheet.max_row + 1):
+        po_number = _normalise_po(worksheet.cell(row_number, po_col).value)
+        # 只要 PO 有 FLD 附件，就必须保留透视表的项目汇总 Saving，即使该汇总
+        # 当前缺值或有歧义，也不能退回为普通物料的逐行计算。
+        if po_number not in no_fld_pos_seen:
+            continue
+        if row_number in protected_non_fld_rows:
+            continue
+
+        old_price = _number(_read_merged_value(worksheet, row_number, old_price_col))
+        net_price = _number(_read_merged_value(worksheet, row_number, net_price_col))
+        order_quantity = _number(
+            _read_merged_value(worksheet, row_number, purchase_order_quantity_col)
+        )
+        if old_price is None or net_price is None or order_quantity is None:
+            non_fld_saving_skipped += 1
+            continue
+
+        saving_value = round((old_price - net_price) * order_quantity, 2)
+        if saving_value == 0:
+            saving_value = 0
+        _write_merged_value(worksheet, row_number, saving_col, saving_value)
+        non_fld_saving_written += 1
+
+    _status("正在计算 CHECK（新价格 - 净价）...")
+    check_written = 0
+    check_skipped = 0
+    for row_number in range(2, worksheet.max_row + 1):
+        po_number = _normalise_po(worksheet.cell(row_number, po_col).value)
+        if not po_number or po_number in unclassified_download_pos:
+            continue
+        if row_number in protected_non_fld_rows:
+            continue
+        new_price = _number(_read_merged_value(worksheet, row_number, new_price_col))
+        net_price = _number(_read_merged_value(worksheet, row_number, net_price_col))
+        if new_price is None or net_price is None:
+            check_skipped += 1
+            continue
+
+        check_value = round(new_price - net_price, 2)
+        # Excel 显示 -0.0 容易造成误判；业务要求差额为零时必须写入整数 0。
+        if check_value == 0:
+            check_value = 0
+        _write_merged_value(worksheet, row_number, check_col, check_value)
+        check_written += 1
+
+    _status("正在将连续的 FLD PO 汇总列合并展示...")
+    fld_merged_groups = 0
+    for po_number in fld_pivot_values:
+        for row_group in _contiguous_row_groups(po_to_rows[po_number]):
+            fld_merged_groups += _merge_fld_display_group(
+                worksheet,
+                po_number,
+                row_group,
+                (old_price_col, new_price_col, saving_col),
+            )
+
+    try:
+        workbook.save(EXCEL_FILE)
+    except Exception as exc:
+        workbook.close()
+        return False, f"无法保存采购记录文件：\n{exc}"
+    workbook.close()
+
+    summary = [
+        "空调老/新价格填充完成",
+        (
+            f"实际附件分类：FLD {len(fld_pos_seen)} 个 PO / "
+            f"无 FLD {len(no_fld_pos_seen)} 个 PO / "
+            f"未判定 {len(unclassified_download_pos)} 个 PO"
+        ),
+        f"主匹配（短文本 → SAP Discription-Ner）：{primary_matches} 行",
+        f"备用匹配（安装调试费（含辅料）→ Discription）：{installation_fallback_matches} 行",
+        f"FLD PO 覆盖：{len(fld_pivot_values)} 个 PO / {fld_override_rows} 条明细",
+        "FLD 覆盖规则：老价格 = 总saving；新价格 = 订单净值；Saving = 两者差额",
+        f"FLD 分组合并：{fld_merged_groups} 组（老价格、新价格、Saving；淡黄色）",
+        f"无 FLD 已有结果保护：{len(protected_non_fld_rows)} 条（重复执行不覆盖四列）",
+        f"无 FLD Saving：已计算 {non_fld_saving_written} 条（老价格 - 净价）× 采购订单数量",
+        f"CHECK：已计算 {check_written} 条（新价格 - 净价；差额为零写 0）",
+    ]
+    if unmatched_texts:
+        summary.append("未匹配并保持为空：" + "、".join(sorted(unmatched_texts)))
+    if ambiguous_texts:
+        summary.append("价格存在歧义，未写入：" + "、".join(sorted(ambiguous_texts)))
+    if invalid_fld_pos:
+        summary.append("FLD PO 缺少有效总saving/订单净值，保留价格表结果：" + "、".join(sorted(invalid_fld_pos)))
+    if ambiguous_fld_pos:
+        summary.append("FLD PO 汇总值不一致，保留价格表结果：" + "、".join(sorted(ambiguous_fld_pos)))
+    if download_missing_pos:
+        summary.append(
+            "未找到任何下载目录，四列未修改："
+            + "、".join(sorted(download_missing_pos))
+        )
+    if download_scan_error_pos:
+        summary.append(
+            "附件目录扫描失败，四列未修改："
+            + "、".join(sorted(download_scan_error_pos))
+        )
+        for po_number in sorted(download_scan_error_pos):
+            errors = download_scan_errors.get(po_number) or []
+            if errors:
+                summary.append(
+                    f"  · {po_number}：{'; '.join(str(error) for error in errors[:2])}"
+                )
+    if non_fld_saving_skipped:
+        summary.append(
+            f"无 FLD Saving 保持原值：{non_fld_saving_skipped} 条缺少有效老价格、净价或采购订单数量"
+        )
+    if check_skipped:
+        summary.append(f"CHECK 保持原值：{check_skipped} 条缺少有效新价格或净价")
+    summary.append(f"价格表：{os.path.basename(price_file)} / {AIR_PRICE_LIST_SHEET}")
+    return True, "\n".join(summary)
+
+
+def generate_pivot_table(category=None, status_callback=None):
+    """
+    品类驱动的完整工作流：
+      1. 按品类配置：插入品类专属列（差异化预处理）
+      2. pandas 筛选物料 → 写入品类数据 Sheet
+      3. COM 生成原生透视表 → 品类透视表 Sheet（Sheet1 右侧）
     """
     _log = lambda msg: status_callback and status_callback(msg)
+    cfg = _cfg(category)
+    label = cfg["label"]
+    filter_materials = cfg["filter_materials"]
+    data_sheet = cfg["data_sheet"]
+    target_sheet = cfg["target_sheet"]
+    pivot_table_name = cfg["pivot_table_name"]
 
     # ── 1. 检查文件 ──
     if not os.path.exists(EXCEL_FILE):
         return False, f"找不到主数据文件：\n{EXCEL_FILE}"
-    if not os.path.exists(FACTORY_FILE):
-        return False, f"找不到工厂清单文件：\n{FACTORY_FILE}"
 
     # ── 2. 校验 Sheet1 列名 ──
-    _log("正在校验列名...")
+    _log(f"[{label}] 正在校验列名...")
     try:
         import pandas as pd
         df_head = pd.read_excel(EXCEL_FILE, sheet_name=SOURCE_SHEET, nrows=0)
@@ -737,33 +1509,27 @@ def generate_pivot_table(status_callback=None):
     except Exception as e:
         return False, f"读取 Excel 失败：\n{e}"
 
-    # ── 3. 读取工厂清单，建映射 ──
+    # ── 3. 增强 Sheet1 + 筛选 → 写入品类数据 Sheet ──
     try:
-        plant_map, factory_debug = _build_plant_mapping(_log)
-    except Exception as e:
-        return False, f"读取工厂清单失败：\n{e}"
-
-    # ── 4. 增强 Sheet1 + 筛选 → 写入「装潢数据」──
-    try:
-        total_cols, total_rows, match_debug = _enhance_and_filter(plant_map, _log)
+        total_cols, total_rows, match_debug = _enhance_and_filter(cfg, _log)
     except Exception as e:
         return False, f"数据增强/筛选失败：\n{e}"
 
-    # 汇总诊断信息
-    all_debug = f"{factory_debug}\n\n{match_debug}"
-
-    # ── 5. COM 生成原生透视表 ──
-    _log("正在调用 Excel 引擎生成原生透视表...")
+    # ── 4. COM 生成原生透视表 ──
+    _log(f"[{label}] 正在调用 Excel 引擎生成原生透视表...")
     excel = None
     wb = None
     try:
         excel = _com_start()
-        _log("COM 打开增强后的文件...")
+        _log(f"[{label}] COM 打开增强后的文件...")
         wb = excel.Workbooks.Open(EXCEL_FILE)
         if wb is None:
             return False, "COM 无法打开文件，请关闭其他正在使用该文件的程序后重试。"
 
-        _com_create_pivot(wb, total_cols, total_rows, source_name=DATA_SHEET)
+        _com_create_pivot(wb, total_cols, total_rows,
+                          source_name=data_sheet,
+                          target_sheet=target_sheet,
+                          pivot_table_name=pivot_table_name)
 
         _log("正在保存...")
         wb.Save()
@@ -776,125 +1542,467 @@ def generate_pivot_table(status_callback=None):
         _com_stop(excel, wb)
 
     return True, (
-        f"原生透视表生成成功！\n\n"
-        f"筛选物料：{FILTER_MATERIALS}\n"
+        f"[{label}] 原生透视表生成成功！\n\n"
+        f"筛选物料：{filter_materials}\n"
         f"筛选后数据行数：{total_rows}\n"
         f"行层级：{' → '.join(ROW_FIELDS)}\n"
         f"值字段：{VALUE_NAME}（求和）\n"
-        f"目标 Sheet：\"{TARGET_SHEET}\"（紧邻 Sheet1 右侧）\n\n"
-        f"Sheet1 原有格式完整保留，仅在「订单净值」右侧新增了「区域」和「分公司」两列。\n\n"
-        f"════════════ 诊断信息 ════════════\n{all_debug}"
+        f"目标 Sheet：\"{target_sheet}\"（紧邻 Sheet1 右侧）\n\n"
+        f"Sheet1 原有格式完整保留，仅新增了品类相关列。\n\n"
+        f"════════════ 诊断信息 ════════════\n{match_debug}"
     )
 
 
 # ═══════════════════ GUI 界面 ═══════════════════
 
+WINDOW_DEFAULT_WIDTH = 760
+WINDOW_DEFAULT_HEIGHT = 780
+WINDOW_SAFE_MARGIN = 32
+
+
+def fit_window_geometry(screen_width, screen_height,
+                        desired_width=WINDOW_DEFAULT_WIDTH,
+                        desired_height=WINDOW_DEFAULT_HEIGHT,
+                        margin=WINDOW_SAFE_MARGIN):
+    """返回始终落在可视屏幕内的初始窗口尺寸与坐标。
+
+    Windows 高 DPI 缩放时，Tk 取得的逻辑屏幕高度可能小于默认窗口高度。
+    先收缩窗口、再留出四周安全边距，避免标题栏和系统关闭按钮被放到屏幕外。
+    """
+    screen_width = max(1, int(screen_width))
+    screen_height = max(1, int(screen_height))
+    margin = max(0, int(margin))
+    max_width = max(1, screen_width - margin * 2)
+    max_height = max(1, screen_height - margin * 2)
+    width = min(max(1, int(desired_width)), max_width)
+    height = min(max(1, int(desired_height)), max_height)
+    x = max(0, (screen_width - width) // 2)
+    y = max(0, (screen_height - height) // 2)
+    return width, height, x, y
+
+
 class PivotTableApp:
-    """Tkinter 主窗口"""
+    """Tkinter 主窗口 — 支持装潢/空调多品类切换"""
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("装潢透视表生成工具")
-        self.root.geometry("520x440")
-        self.root.resizable(False, False)
-        self.root.configure(bg="#f5f6fa")
+        self.root.title("采购自动化工作台")
+        # 显式保留系统标题栏，用户可通过它自由拖动窗口和关闭程序。
+        self.root.overrideredirect(False)
+        self.root.resizable(True, True)
+        self.root.configure(bg="#eef3f8")
 
-        # 居中
+        self.active_category = "装潢"  # 默认品类
+        self._web_stop_event = None
+
+        # 高 DPI/低分辨率屏幕下，默认 760×780 可能高于逻辑屏幕；
+        # 必须先收缩到可视区域内，否则标题栏会被挤到屏幕上方。
         self.root.update_idletasks()
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
-        self.root.geometry(f"+{(sw - 520) // 2}+{(sh - 440) // 2}")
+        width, height, x, y = fit_window_geometry(sw, sh)
+        self.root.minsize(min(640, width), min(520, height))
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close_request)
 
         self._build_ui()
 
+    def _recenter_window(self):
+        """把窗口重新放回当前屏幕的可见区域，不改变用户已调整的大小。"""
+        self.root.update_idletasks()
+        width, height, x, y = fit_window_geometry(
+            self.root.winfo_screenwidth(),
+            self.root.winfo_screenheight(),
+            desired_width=self.root.winfo_width(),
+            desired_height=self.root.winfo_height(),
+        )
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _on_close_request(self):
+        """提供界面内关闭入口，并在任务运行时提醒用户。"""
+        task_buttons = (
+            getattr(self, "btn_factory", None),
+            getattr(self, "btn", None),
+            getattr(self, "btn_extra", None),
+            getattr(self, "btn_web", None),
+            getattr(self, "btn_retry_missing", None),
+            getattr(self, "btn_backfill", None),
+            getattr(self, "btn_tracking", None),
+            getattr(self, "btn_air_price", None),
+        )
+        is_busy = any(
+            button is not None and str(button.cget("state")) == str(tk.DISABLED)
+            for button in task_buttons
+        )
+        if is_busy and not messagebox.askyesno(
+            "关闭工作台",
+            "当前任务仍在运行。关闭工作台会退出本程序；已打开的 Edge 浏览器可能仍会保留。是否继续？",
+            parent=self.root,
+        ):
+            return
+        self.root.destroy()
+
+    # ── 品类切换 ──
+    def _switch_category(self, category):
+        self.active_category = category
+        self._update_category_buttons()
+        self._update_button_labels()
+        self._update_hint_labels()
+        self._update_air_price_control()
+        self._update_status(
+            f"已切换到「{CATEGORIES[category]['label']}」模式 — 按 ① → ② → ③ → ④ → ⑤ 依次完成",
+            "#3b82f6"
+        )
+
+    def _update_category_buttons(self):
+        active_color = "#2f80ed"
+        inactive_color = "#243b53"
+        for cat, btn in self.cat_buttons.items():
+            if cat == self.active_category:
+                btn.config(bg=active_color, fg="#ffffff")
+            else:
+                btn.config(bg=inactive_color, fg="#bfd3e6")
+
+    def _update_button_labels(self):
+        label = CATEGORIES[self.active_category]["label"]
+        self.btn.config(text=f"① 生成{label}透视表")
+        self.btn_extra.config(text=f"② 添加扩展列")
+        self.btn_web.config(text="③ 打开网站查询")
+        self.btn_retry_missing.config(text="↻ 补查缺失 PO")
+        self.btn_backfill.config(text="④ 回填已下载文件")
+        self.btn_tracking.config(text="⑤ 匹配 PM Tracking")
+
+    def _update_hint_labels(self):
+        cfg = CATEGORIES[self.active_category]
+        label = cfg["label"]
+        materials = cfg["filter_materials"]
+        self.hint1.config(text=f"筛选物料 {materials} → COM 引擎生成原生透视表")
+        self.hint2.config(text=f"在{label}透视表右侧追加 E2E项目名 / Price / PlanCost 等 9 列空白表头")
+        self.hint3.config(
+            text="③ 首次查询下载全部 PO；若日志提示缺失，点击右侧「补查缺失 PO」仅重查缺失项（也可扫描旧运行结果）。"
+        )
+        self.hint_backfill.config(text=f"读取「{label}」已下载附件 → 解析审批价格 / 计算差异 → 写回{label}透视表")
+        content_display = cfg.get("content_filter_display", cfg["content_filter"])
+        self.hint4.config(text=f"E2E项目名模糊匹配 → Content 筛选「{content_display}」→ 计算总 saving / 订单是否下完")
+
+    def _update_air_price_control(self):
+        """空调专用价格步骤不出现在已完成的装潢工作流中。"""
+        if self.active_category == "空调":
+            if not self.air_price_frame.winfo_manager():
+                self.air_price_frame.pack(fill=tk.X)
+        else:
+            self.air_price_frame.pack_forget()
+
     def _build_ui(self):
-        bg = "#f5f6fa"
+        WIN_BG = "#eef3f8"
+        CARD_BG = "#ffffff"
+        HINT_FG = "#66788a"
+        TITLE_FG = "#172b4d"
+        CARD_BORDER = "#d9e2ec"
 
-        # ── 标题 ──
+        # ── 顶部标题栏 ──
+        header = tk.Frame(self.root, bg="#102a43", height=132)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+        # 标题与品类切换占上行，窗口控制固定在下行。这样窗口变窄时不会让
+        # “停止查询”被标题、品类切换按钮挤出可视区域。
+        header_main = tk.Frame(header, bg="#102a43")
+        header_main.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        header_actions = tk.Frame(header, bg="#0b2239", height=38)
+        header_actions.pack(side=tk.BOTTOM, fill=tk.X)
+        header_actions.pack_propagate(False)
+
+        brand = tk.Frame(header_main, bg="#102a43")
+        brand.pack(side=tk.LEFT, padx=(26, 0), pady=(16, 0))
         tk.Label(
-            self.root, text="装潢透视表生成工具",
-            font=("Microsoft YaHei", 14, "bold"),
-            fg="#2c3e50", bg=bg,
-        ).pack(pady=(25, 8))
-
-        # ── 说明 ──
-        desc = (
-            f"数据目录：{SCRIPT_DIR}\n"
-            f"数据源：EXPORT1 2 1.xlsx → {SOURCE_SHEET}\n"
-            f"工厂清单：工厂清单 7.XLSX（Plant→区域+分公司）\n"
-            f"筛选：物料 ∈ {FILTER_MATERIALS}\n"
-            f"透视：{' → '.join(ROW_FIELDS)} | {VALUE_FIELD}（求和）\n\n"
-            f"更新方法：替换本目录下同名文件后重新运行即可"
-        )
+            brand, text="采购自动化工作台",
+            font=("Microsoft YaHei", 17, "bold"),
+            fg="#ffffff", bg="#102a43",
+        ).pack(anchor=tk.W)
         tk.Label(
-            self.root, text=desc,
-            font=("Microsoft YaHei", 9), fg="#7f8c8d", bg=bg,
-            justify=tk.LEFT,
-        ).pack(pady=(0, 18))
+            brand, text="数据准备 · 附件查询 · Excel 回填 · PM Tracking",
+            font=("Microsoft YaHei", 9),
+            fg="#a9c5df", bg="#102a43",
+        ).pack(anchor=tk.W, pady=(3, 0))
 
-        # ── 核心按钮 ──
-        self.btn = tk.Button(
-            self.root, text="生成装潢透视表",
-            font=("Microsoft YaHei", 13, "bold"),
-            bg="#27ae60", fg="white",
-            activebackground="#2ecc71", activeforeground="white",
-            relief=tk.FLAT, padx=40, pady=12,
-            cursor="hand2", borderwidth=0,
-            command=self._on_click,
+        # 品类切换按钮组
+        cat_frame = tk.Frame(header_main, bg="#102a43")
+        cat_frame.pack(side=tk.RIGHT, padx=(0, 20), pady=(18, 0))
+        self.cat_buttons = {}
+        categories_order = list(CATEGORIES.keys())
+        for i, cat_key in enumerate(categories_order):
+            cat_cfg = CATEGORIES[cat_key]
+            is_active = (cat_key == self.active_category)
+            btn = tk.Button(
+                cat_frame, text=f"  {cat_cfg['label']}  ",
+                font=("Microsoft YaHei", 10, "bold"),
+                bg="#2f80ed" if is_active else "#243b53",
+                fg="#ffffff" if is_active else "#bfd3e6",
+                activebackground="#4c9aff", activeforeground="#ffffff",
+                relief=tk.FLAT, padx=18, pady=7,
+                cursor="hand2", borderwidth=0, highlightthickness=0,
+                command=lambda c=cat_key: self._switch_category(c),
+            )
+            btn.pack(side=tk.LEFT, padx=(0 if i == 0 else 4, 0))
+            self.cat_buttons[cat_key] = btn
+
+        # 窗口控制始终独占一行，确保缩小时三个关键按钮都不会被裁掉。
+        window_controls = tk.Frame(header_actions, bg="#0b2239")
+        window_controls.pack(side=tk.RIGHT, padx=(0, 20), pady=4)
+        tk.Button(
+            window_controls, text="居中", font=("Microsoft YaHei", 9),
+            bg="#36516d", fg="#e8f1f8", activebackground="#4c6d8d",
+            activeforeground="#ffffff", relief=tk.FLAT, padx=12, pady=6,
+            cursor="hand2", borderwidth=0, highlightthickness=0,
+            command=self._recenter_window,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        self.btn_close = tk.Button(
+            window_controls, text="关闭工作台", font=("Microsoft YaHei", 9),
+            bg="#b93b4a", fg="#ffffff", activebackground="#d75061",
+            activeforeground="#ffffff", relief=tk.FLAT, padx=12, pady=6,
+            cursor="hand2", borderwidth=0, highlightthickness=0,
+            command=self._on_close_request,
         )
-        self.btn.pack(pady=(0, 8))
-
-        # ── 扩展列按钮 ──
-        self.btn_extra = tk.Button(
-            self.root, text="添加扩展列（透视表右侧）",
-            font=("Microsoft YaHei", 10),
-            bg="#3498db", fg="white",
-            activebackground="#5dade2", activeforeground="white",
-            relief=tk.FLAT, padx=25, pady=8,
-            cursor="hand2", borderwidth=0,
-            command=self._on_extra_click,
+        self.btn_close.pack(side=tk.LEFT)
+        self.btn_stop_web = tk.Button(
+            window_controls, text="⏹ 停止查询", font=("Microsoft YaHei", 9, "bold"),
+            bg="#7f1d1d", fg="#f8fafc", disabledforeground="#f8fafc",
+            activebackground="#dc2626", activeforeground="#ffffff", relief=tk.FLAT, padx=12, pady=6,
+            cursor="hand2", borderwidth=0, highlightthickness=0,
+            command=self._on_stop_web_click, state=tk.DISABLED,
         )
-        self.btn_extra.pack(pady=(0, 5))
+        self.btn_stop_web.pack(side=tk.LEFT, padx=(6, 0))
 
-        # ── 网站查询按钮 ──
+        # 内容区可滚动：小屏或高 DPI 缩放时不会再为了容纳所有卡片把窗口
+        # 顶出屏幕，窗口依然可以任意拖动和缩放。
+        content_shell = tk.Frame(self.root, bg=WIN_BG)
+        content_shell.pack(fill=tk.BOTH, expand=True)
+        self.content_canvas = tk.Canvas(
+            content_shell, bg=WIN_BG, highlightthickness=0, borderwidth=0,
+        )
+        content_scrollbar = tk.Scrollbar(
+            content_shell, orient=tk.VERTICAL, command=self.content_canvas.yview,
+        )
+        self.content_canvas.configure(yscrollcommand=content_scrollbar.set)
+        content_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.content_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        content = tk.Frame(self.content_canvas, bg=WIN_BG)
+        self._content_window = self.content_canvas.create_window(
+            (0, 0), window=content, anchor=tk.NW,
+        )
+
+        def _refresh_scroll_region(_event=None):
+            self.content_canvas.configure(scrollregion=self.content_canvas.bbox("all"))
+
+        def _fit_content_width(event):
+            self.content_canvas.itemconfigure(self._content_window, width=event.width)
+            self.content_canvas.after_idle(_refresh_scroll_region)
+
+        content.bind("<Configure>", _refresh_scroll_region)
+        self.content_canvas.bind("<Configure>", _fit_content_width)
+
+        # ── 卡片样式工厂 ──
+        def _card(parent, title):
+            """创建一张卡片：白色背景 + 细边框 + 标题"""
+            outer = tk.Frame(parent, bg=CARD_BORDER, bd=0)
+            inner = tk.Frame(outer, bg=CARD_BG, bd=0)
+            inner.pack(padx=1, pady=1, fill=tk.BOTH, expand=True)
+            title_row = tk.Frame(inner, bg=CARD_BG)
+            title_row.pack(fill=tk.X, padx=20, pady=(13, 4))
+            tk.Label(
+                title_row, text=title,
+                font=("Microsoft YaHei", 11, "bold"),
+                fg=TITLE_FG, bg=CARD_BG,
+            ).pack(side=tk.LEFT)
+            return outer, inner
+
+        def _btn(parent, text, bg_color, active_color, command):
+            """创建统一风格的按钮"""
+            btn = tk.Button(
+                parent, text=text,
+                font=("Microsoft YaHei", 11),
+                bg=bg_color, fg="#ffffff",
+                activebackground=active_color, activeforeground="#ffffff",
+                relief=tk.FLAT, pady=10,
+                cursor="hand2", borderwidth=0, highlightthickness=0,
+                command=command,
+            )
+            btn.pack(fill=tk.X, padx=20, pady=(4, 0))
+            return btn
+
+        def _hint(parent, text):
+            """按钮下方的说明文字"""
+            lbl = tk.Label(
+                parent, text=text,
+                font=("Microsoft YaHei", 8), fg=HINT_FG, bg=CARD_BG,
+                justify=tk.LEFT, wraplength=680,
+            )
+            lbl.pack(anchor=tk.W, padx=22, pady=(2, 0))
+            return lbl
+
+        def _sep(parent):
+            """细分隔线"""
+            ttk.Separator(parent, orient=tk.HORIZONTAL).pack(
+                fill=tk.X, padx=20, pady=8
+            )
+
+        # ══════════ 卡片 1：Excel 数据处理 ══════════
+        cfg_default = CATEGORIES[self.active_category]
+        c1_outer, c1 = _card(content, "01  数据准备")
+        c1_outer.pack(fill=tk.X, padx=24, pady=(18, 0))
+
+        # ── 独立按钮：匹配区域/分公司（品类无关）──
+        self.btn_factory = _btn(
+            c1, "🔧 匹配区域/分公司",
+            "#f59e0b", "#fbbf24", self._on_factory_click,
+        )
+        self.hint_factory = _hint(c1, "读取工厂清单 → Sheet1 插入区域/分公司列 → 按 Plant 填值（跑一次即可）")
+
+        _sep(c1)
+
+        self.btn = _btn(
+            c1, f"① 生成{cfg_default['label']}透视表",
+            "#10b981", "#34d399", self._on_click,
+        )
+        self.hint1 = _hint(c1, f"筛选物料 {cfg_default['filter_materials']} → COM 引擎生成原生透视表")
+
+        _sep(c1)
+
+        self.btn_extra = _btn(
+            c1, "② 添加扩展列",
+            "#3b82f6", "#60a5fa", self._on_extra_click,
+        )
+        self.hint2 = _hint(c1, f"在{cfg_default['label']}透视表右侧追加 E2E项目名 / Price / PlanCost 等 9 列空白表头")
+        tk.Frame(c1, bg=CARD_BG, height=10).pack()
+
+        # ══════════ 卡片 2：网站查询与匹配 ══════════
+        c2_outer, c2 = _card(content, "02  网站查询与回填")
+        c2_outer.pack(fill=tk.X, padx=24, pady=(12, 0))
+
+        # ③ 与“补查缺失 PO”并列：两者属于同一网页下载步骤，避免用户误以为
+        # 补查是另一个独立流程。
+        web_action_row = tk.Frame(c2, bg=CARD_BG)
+        web_action_row.pack(fill=tk.X, padx=20, pady=(4, 0))
         self.btn_web = tk.Button(
-            self.root, text="打开网站查询",
+            web_action_row, text="③ 打开网站查询",
             font=("Microsoft YaHei", 10),
-            bg="#8e44ad", fg="white",
-            activebackground="#a569bd", activeforeground="white",
-            relief=tk.FLAT, padx=25, pady=8,
-            cursor="hand2", borderwidth=0,
+            bg="#6c63ff", fg="#ffffff",
+            activebackground="#8b85ff", activeforeground="#ffffff",
+            disabledforeground="#ffffff",
+            relief=tk.FLAT, pady=10,
+            cursor="hand2", borderwidth=0, highlightthickness=0,
             command=self._on_web_click,
         )
-        self.btn_web.pack(pady=(0, 5))
-
-        # ── PM Tracking 匹配按钮 ──
-        self.btn_tracking = tk.Button(
-            self.root, text="匹配PM Tracking数据",
+        self.btn_web.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        self.btn_retry_missing = tk.Button(
+            web_action_row, text="↻ 补查缺失 PO",
             font=("Microsoft YaHei", 10),
-            bg="#16a085", fg="white",
-            activebackground="#1abc9c", activeforeground="white",
-            relief=tk.FLAT, padx=25, pady=8,
-            cursor="hand2", borderwidth=0,
-            command=self._on_tracking_click,
+            bg="#475569", fg="#ffffff",
+            activebackground="#64748b", activeforeground="#ffffff",
+            disabledforeground="#ffffff",
+            relief=tk.FLAT, pady=10,
+            cursor="hand2", borderwidth=0, highlightthickness=0,
+            command=self._on_retry_missing_click,
         )
-        self.btn_tracking.pack(pady=(0, 15))
+        self.btn_retry_missing.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+        self.hint3 = _hint(
+            c2,
+            "③ 首次查询下载全部 PO；若日志提示缺失，点击右侧「补查缺失 PO」仅重查缺失项（也可扫描旧运行结果）。",
+        )
 
-        # ── 状态 ──
-        self.lbl_status = tk.Label(
-            self.root, text="就绪 — 点击按钮开始",
-            font=("Microsoft YaHei", 9), fg="#95a5a6", bg=bg,
+        _sep(c2)
+
+        self.btn_backfill = _btn(
+            c2, "④ 回填已下载文件",
+            "#0f9d8a", "#16bda5", self._on_backfill_click,
         )
-        self.lbl_status.pack()
+        self.hint_backfill = _hint(c2, "读取已下载附件 → 解析审批价格 / 计算差异 → 写回当前品类透视表")
+
+        _sep(c2)
+
+        self.btn_tracking = _btn(
+            c2, "⑤ 匹配 PM Tracking",
+            "#06b6d4", "#22d3ee", self._on_tracking_click,
+        )
+        default_content_display = cfg_default.get("content_filter_display", cfg_default["content_filter"])
+        self.hint4 = _hint(c2, f"E2E项目名模糊匹配 → Content 筛选「{default_content_display}」→ 计算 总saving / 订单是否下完")
+        tk.Frame(c2, bg=CARD_BG, height=10).pack()
+
+        # ── 日志输出区 ──
+        self.air_price_frame = tk.Frame(c2, bg=CARD_BG)
+        self.btn_air_price = _btn(
+            self.air_price_frame, "⑥ 填充空调老/新价格",
+            "#7c3aed", "#8b5cf6", self._on_air_price_click,
+        )
+        self.hint_air_price = _hint(
+            self.air_price_frame,
+            "FLD PO 用透视表覆盖；无 FLD Saving =（老价格 - 净价）× 采购订单数量；CHECK = 新价格 - 净价",
+        )
+
+        log_frame = tk.Frame(content, bg="#102a43")
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=24, pady=(12, 0))
+        log_label = tk.Label(
+            log_frame, text="运行日志", font=("Microsoft YaHei", 9, "bold"),
+            fg="#b8d4eb", bg="#102a43", anchor=tk.W,
+        )
+        log_label.pack(fill=tk.X, padx=10, pady=(7, 2))
+        self.log_text = tk.Text(
+            log_frame, bg="#0b1f33", fg="#d8e7f3", font=("Consolas", 9),
+            wrap=tk.WORD, relief=tk.FLAT, borderwidth=0,
+            insertbackground="#d8e7f3", state=tk.DISABLED, padx=10, pady=8,
+        )
+        log_scroll = tk.Scrollbar(log_frame, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0, 5))
+
+        # ── 底部状态栏 ──
+        status_bar = tk.Frame(self.root, bg="#102a43", height=32)
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        status_bar.pack_propagate(False)
+        self.lbl_status = tk.Label(
+            status_bar, text="就绪 — 请按 ① → ② → ③ → ④ → ⑤ 顺序操作",
+            font=("Microsoft YaHei", 8), fg="#b8d4eb", bg="#102a43",
+        )
+        self.lbl_status.pack(side=tk.LEFT, padx=26, pady=(6, 0))
+
+    def _on_factory_click(self):
+        """点击匹配区域/分公司（品类无关）"""
+        self.btn_factory.config(state=tk.DISABLED, text="正在匹配...")
+        self._update_status("正在匹配区域/分公司...", "#f59e0b")
+
+        def _run():
+            try:
+                success, msg = apply_factory_mapping(
+                    status_callback=lambda m: self.root.after(0, self._update_status, m, "#f59e0b")
+                )
+                self.root.after(0, lambda: self._factory_done(success, msg))
+            except Exception as e:
+                err_msg = f"错误：\n{e}\n\n{traceback.format_exc()}"
+                self.root.after(0, lambda: self._factory_done(False, err_msg))
+
+        self.root.after(100, _run)
+
+    def _factory_done(self, success, msg):
+        self.btn_factory.config(state=tk.NORMAL, text="🔧 匹配区域/分公司")
+        if success:
+            self._update_status("区域/分公司匹配完成！", "#27ae60")
+            self._show_copyable_dialog("✅ 工厂映射", msg)
+        else:
+            self._update_status("匹配失败，见弹窗", "#e74c3c")
+            self._show_copyable_dialog("❌ 匹配失败", msg, is_error=True)
 
     def _on_click(self):
-        """点击按钮"""
+        """点击生成透视表"""
+        category = self.active_category
+        label = CATEGORIES[category]["label"]
         self.btn.config(state=tk.DISABLED, text="处理中，请稍候...")
-        self._update_status("正在处理...", "#e67e22")
+        self._update_status(f"[{label}] 正在处理...", "#e67e22")
 
         def _run():
             try:
                 success, msg = generate_pivot_table(
+                    category=category,
                     status_callback=lambda m: self.root.after(0, self._update_status, m, "#e67e22")
                 )
                 self.root.after(0, lambda: self._done(success, msg))
@@ -906,15 +2014,95 @@ class PivotTableApp:
 
     def _update_status(self, msg, color):
         self.lbl_status.config(text=msg, fg=color)
+        # 同时写入日志区
+        ts = time.strftime("%H:%M:%S")
+        self._log(f"{ts}  {msg}")
+
+    def _log(self, msg):
+        """写入日志区（线程安全）"""
+        try:
+            self.log_text.configure(state=tk.NORMAL)
+            self.log_text.insert(tk.END, msg + "\n")
+            self.log_text.see(tk.END)
+            self.log_text.configure(state=tk.DISABLED)
+        except Exception:
+            pass
+
+    def _show_copyable_dialog(self, title, msg, is_error=False):
+        """显示可选中复制的完成提示，不锁定主工作台。"""
+        dlg = tk.Toplevel(self.root)
+        dlg.title(title)
+        dialog_width, dialog_height = 620, 440
+        self.root.update_idletasks()
+        screen_x = self.root.winfo_vrootx()
+        screen_y = self.root.winfo_vrooty()
+        screen_right = screen_x + self.root.winfo_vrootwidth()
+        screen_bottom = screen_y + self.root.winfo_vrootheight()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - dialog_width) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - dialog_height) // 2
+        x = max(screen_x, min(x, screen_right - dialog_width))
+        y = max(screen_y, min(y, screen_bottom - dialog_height))
+        dlg.geometry(f"{dialog_width}x{dialog_height}+{x}+{y}")
+        dlg.minsize(460, 300)
+        dlg.resizable(True, True)
+        dlg.configure(bg="#1a2332")
+        dlg.transient(self.root)
+
+        # 完成提示必须始终是非模态的：即便窗口映射或焦点异常，主工作台
+        # 仍可点击、移动和关闭，绝不能再被一个不可见的提示窗锁死。
+        def _close_dialog():
+            if dlg.winfo_exists():
+                dlg.destroy()
+
+        dlg.protocol("WM_DELETE_WINDOW", _close_dialog)
+        dlg.bind("<Escape>", lambda _event: _close_dialog())
+        # 标题
+        tk.Label(
+            dlg, text=title, font=("Microsoft YaHei", 12, "bold"),
+            fg="#e74c3c" if is_error else "#27ae60", bg="#1a2332",
+        ).pack(pady=(12, 0))
+        # 可复制的文本框
+        text_frame = tk.Frame(dlg, bg="#0a1018")
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=8)
+        text_widget = tk.Text(
+            text_frame, bg="#0a1018", fg="#b0c0d0",
+            font=("Consolas", 10), wrap=tk.WORD,
+            relief=tk.FLAT, borderwidth=0, padx=10, pady=10,
+        )
+        text_widget.insert("1.0", msg)
+        text_widget.configure(state=tk.DISABLED)
+        scrollbar = tk.Scrollbar(text_frame, command=text_widget.yview)
+        text_widget.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        text_widget.pack(fill=tk.BOTH, expand=True)
+        # 提示
+        tk.Label(
+            dlg, text="💡 可按 Ctrl+A 全选, Ctrl+C 复制内容",
+            font=("Microsoft YaHei", 8), fg="#7b8ca0", bg="#1a2332",
+        ).pack(pady=(0, 6))
+        # 关闭按钮
+        tk.Button(
+            dlg, text="关闭", font=("Microsoft YaHei", 10),
+            bg="#3b82f6", fg="#ffffff", relief=tk.FLAT, padx=30, pady=6,
+            cursor="hand2", command=_close_dialog,
+        ).pack(pady=(0, 14))
+
+        # 创建后立即提高层级并请求焦点；不使用永久置顶，避免妨碍用户继续
+        # 操作 Excel 或浏览器。
+        dlg.lift()
+        dlg.focus_force()
+        return dlg
 
     def _on_extra_click(self):
         """点击添加扩展列"""
+        category = self.active_category
+        label = CATEGORIES[category]["label"]
         self.btn_extra.config(state=tk.DISABLED, text="正在添加...")
-        self._update_status("正在添加扩展列...", "#3498db")
+        self._update_status(f"[{label}] 正在添加扩展列...", "#3498db")
 
         def _run():
             try:
-                success, msg = add_extra_columns()
+                success, msg = add_extra_columns(category=category)
                 self.root.after(0, lambda: self._extra_done(success, msg))
             except Exception as e:
                 err_msg = f"未预料的错误：\n{e}\n\n{traceback.format_exc()}"
@@ -923,53 +2111,162 @@ class PivotTableApp:
         self.root.after(100, _run)
 
     def _extra_done(self, success, msg):
-        self.btn_extra.config(state=tk.NORMAL, text="添加扩展列（透视表右侧）")
+        self.btn_extra.config(state=tk.NORMAL, text="② 添加扩展列")
         if success:
             self._update_status("扩展列添加成功！", "#27ae60")
-            messagebox.showinfo("操作成功", msg)
+            self._show_copyable_dialog("✅ 扩展列", msg)
         else:
             self._update_status("添加失败，见弹窗", "#e74c3c")
-            messagebox.showerror("操作失败", msg)
+            self._show_copyable_dialog("❌ 操作失败", msg, is_error=True)
+
+    def _on_stop_web_click(self):
+        """请求在当前 PO 完成后的安全检查点停止网页查询。"""
+        if self._web_stop_event is None or self._web_stop_event.is_set():
+            return
+        self._web_stop_event.set()
+        self.btn_stop_web.config(state=tk.DISABLED, text="⏹ 正在停止...", bg="#7f1d1d", fg="#f8fafc")
+        self._update_status("已请求停止：当前 PO 完成后将保存已下载文件并停止后续查询。", "#ef4444")
 
     def _on_web_click(self):
-        """点击网站查询按钮"""
-        self.btn_web.config(state=tk.DISABLED, text="正在启动浏览器...")
-        self._update_status("正在启动 Edge 浏览器...", "#8e44ad")
+        """点击查询并下载附件按钮（不回填 Excel）。"""
+        category = self.active_category
+        label = CATEGORIES[category]["label"]
+        stop_event = threading.Event()
+        self._web_stop_event = stop_event
+        self.btn_web.config(state=tk.DISABLED, text="正在查询并下载...")
+        self.btn_retry_missing.config(state=tk.DISABLED, text="↻ 补查缺失 PO")
+        self.btn_stop_web.config(state=tk.NORMAL, text="⏹ 停止查询", bg="#dc2626", fg="#ffffff")
+        self._update_status(f"[{label}] 正在启动 Edge 查询附件...", "#6c63ff")
 
         def _run():
             try:
                 import web_query
-                success, msg = web_query.open_website_and_search(
-                    status_callback=lambda m: self.root.after(0, self._update_status, m, "#8e44ad")
+                target_sheet = CATEGORIES[category]["target_sheet"]
+                category_label = CATEGORIES[category]["label"]
+                success, msg = web_query.query_and_download_attachments(
+                    target_sheet=target_sheet,
+                    category_label=category_label,
+                    status_callback=lambda m: self.root.after(0, self._update_status, m, "#6c63ff"),
+                    stop_requested=stop_event,
                 )
-                self.root.after(0, lambda: self._web_done(success, msg))
+                self.root.after(0, lambda: self._web_done(success, msg, stop_event))
             except ImportError:
                 self.root.after(0, lambda: self._web_done(
-                    False, "缺少 playwright 模块，请先运行：\npip install playwright\nplaywright install msedge"
+                    False, "缺少 playwright 模块，请先运行：\npip install playwright\nplaywright install msedge", stop_event
                 ))
             except Exception as e:
                 err_msg = f"未预料的错误：\n{e}\n\n{traceback.format_exc()}"
-                self.root.after(0, lambda: self._web_done(False, err_msg))
+                self.root.after(0, lambda: self._web_done(False, err_msg, stop_event))
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _web_done(self, success, msg):
-        self.btn_web.config(state=tk.NORMAL, text="打开网站查询")
-        if success:
-            self._update_status("网站查询完成！", "#27ae60")
-            messagebox.showinfo("操作完成", msg)
+    def _web_done(self, success, msg, stop_event=None):
+        if self._web_stop_event is stop_event:
+            self._web_stop_event = None
+        self.btn_web.config(state=tk.NORMAL, text="③ 打开网站查询")
+        self.btn_retry_missing.config(state=tk.NORMAL, text="↻ 补查缺失 PO")
+        self.btn_stop_web.config(state=tk.DISABLED, text="⏹ 停止查询", bg="#7f1d1d", fg="#f8fafc")
+        stopped = bool(stop_event and stop_event.is_set()) or msg.startswith("⏹")
+        if stopped:
+            self._update_status("查询已停止；已完成的附件可直接回填。", "#f59e0b")
+            self._show_copyable_dialog("⏹ 查询已停止", msg)
+        elif success:
+            self._update_status("查询与附件下载完成，可进行回填。", "#27ae60")
+            self._show_copyable_dialog("✅ 查询与下载完成", msg)
         else:
-            self._update_status("网站查询失败，见弹窗", "#e74c3c")
-            messagebox.showerror("操作失败", msg)
+            self._update_status("查询与下载失败，见弹窗", "#e74c3c")
+            self._show_copyable_dialog("❌ 查询与下载失败", msg, is_error=True)
 
-    def _on_tracking_click(self):
-        """点击 PM Tracking 匹配按钮"""
-        self.btn_tracking.config(state=tk.DISABLED, text="正在匹配...")
-        self._update_status("正在匹配 NI PM Saving Tracking...", "#16a085")
+    def _on_retry_missing_click(self):
+        """扫描当前品类已有目录，只重新查询确实缺失的 PO。"""
+        category = self.active_category
+        label = CATEGORIES[category]["label"]
+        stop_event = threading.Event()
+        self._web_stop_event = stop_event
+        self.btn_web.config(state=tk.DISABLED, text="③ 打开网站查询")
+        self.btn_retry_missing.config(state=tk.DISABLED, text="正在核对并补查...")
+        self.btn_stop_web.config(state=tk.NORMAL, text="⏹ 停止查询", bg="#dc2626", fg="#ffffff")
+        self._update_status(f"[{label}] 正在核对本地 PO 目录并补查缺失项...", "#475569")
 
         def _run():
             try:
-                success, msg = match_pm_tracking_data()
+                import web_query
+                success, msg = web_query.retry_missing_pos(
+                    target_sheet=CATEGORIES[category]["target_sheet"],
+                    category_label=CATEGORIES[category]["label"],
+                    status_callback=lambda m: self.root.after(0, self._update_status, m, "#475569"),
+                    stop_requested=stop_event,
+                )
+                self.root.after(0, lambda: self._retry_missing_done(success, msg, stop_event))
+            except ImportError:
+                self.root.after(0, lambda: self._retry_missing_done(
+                    False, "缺少 playwright 模块，请先运行：\npip install playwright\nplaywright install msedge", stop_event
+                ))
+            except Exception as e:
+                err_msg = f"未预料的错误：\n{e}\n\n{traceback.format_exc()}"
+                self.root.after(0, lambda: self._retry_missing_done(False, err_msg, stop_event))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _retry_missing_done(self, success, msg, stop_event=None):
+        """恢复网页下载操作后的控件状态；和完整查询共用停止开关。"""
+        if self._web_stop_event is stop_event:
+            self._web_stop_event = None
+        self.btn_web.config(state=tk.NORMAL, text="③ 打开网站查询")
+        self.btn_retry_missing.config(state=tk.NORMAL, text="↻ 补查缺失 PO")
+        self.btn_stop_web.config(state=tk.DISABLED, text="⏹ 停止查询", bg="#7f1d1d", fg="#f8fafc")
+        stopped = bool(stop_event and stop_event.is_set()) or msg.startswith("⏹")
+        if stopped:
+            self._update_status("补查已停止；已完成的附件会保留。", "#f59e0b")
+            self._show_copyable_dialog("⏹ 补查已停止", msg)
+        elif success:
+            self._update_status("缺失 PO 补查完成，可执行回填。", "#27ae60")
+            self._show_copyable_dialog("✅ 缺失 PO 补查完成", msg)
+        else:
+            self._update_status("缺失 PO 补查未完成，见弹窗。", "#e74c3c")
+            self._show_copyable_dialog("❌ 缺失 PO 补查未完成", msg, is_error=True)
+
+    def _on_backfill_click(self):
+        """点击回填按钮：只处理当前品类已下载的待回填任务。"""
+        category = self.active_category
+        label = CATEGORIES[category]["label"]
+        self.btn_backfill.config(state=tk.DISABLED, text="正在解析并回填...")
+        self._update_status(f"[{label}] 正在解析附件并回填 Excel...", "#0f9d8a")
+
+        def _run():
+            try:
+                import web_query
+                success, msg = web_query.backfill_downloaded_results(
+                    target_sheet=CATEGORIES[category]["target_sheet"],
+                    category_label=CATEGORIES[category]["label"],
+                    status_callback=lambda m: self.root.after(0, self._update_status, m, "#0f9d8a")
+                )
+                self.root.after(0, lambda: self._backfill_done(success, msg))
+            except Exception as e:
+                err_msg = f"未预料的错误：\n{e}\n\n{traceback.format_exc()}"
+                self.root.after(0, lambda: self._backfill_done(False, err_msg))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _backfill_done(self, success, msg):
+        self.btn_backfill.config(state=tk.NORMAL, text="④ 回填已下载文件")
+        if success:
+            self._update_status("Excel 回填完成！", "#27ae60")
+            self._show_copyable_dialog("✅ 回填完成", msg)
+        else:
+            self._update_status("回填未完成，任务已保留", "#e74c3c")
+            self._show_copyable_dialog("❌ 回填未完成", msg, is_error=True)
+
+    def _on_tracking_click(self):
+        """点击 PM Tracking 匹配按钮"""
+        category = self.active_category
+        label = CATEGORIES[category]["label"]
+        self.btn_tracking.config(state=tk.DISABLED, text="正在匹配...")
+        self._update_status(f"[{label}] 正在匹配 NI PM Saving Tracking...", "#16a085")
+
+        def _run():
+            try:
+                success, msg = match_pm_tracking_data(category=category)
                 self.root.after(0, lambda: self._tracking_done(success, msg))
             except Exception as e:
                 err_msg = f"错误：\n{e}\n\n{traceback.format_exc()}"
@@ -978,22 +2275,65 @@ class PivotTableApp:
         threading.Thread(target=_run, daemon=True).start()
 
     def _tracking_done(self, success, msg):
-        self.btn_tracking.config(state=tk.NORMAL, text="匹配PM Tracking数据")
+        self.btn_tracking.config(state=tk.NORMAL, text="⑤ 匹配 PM Tracking")
         if success:
             self._update_status("PM Tracking 匹配完成！", "#27ae60")
-            messagebox.showinfo("匹配完成", msg)
+            self._show_copyable_dialog("✅ PM匹配报告", msg)
         else:
             self._update_status("匹配失败，见弹窗", "#e74c3c")
-            messagebox.showerror("匹配失败", msg)
+            self._show_copyable_dialog("❌ 匹配失败", msg, is_error=True)
+
+    def _on_air_price_click(self):
+        """选择价格表后，填充空调数据的老价格和新价格。"""
+        if self.active_category != "空调":
+            return
+
+        price_file = filedialog.askopenfilename(
+            parent=self.root,
+            title="选择空调 FY25/26 价格表",
+            initialdir=SCRIPT_DIR,
+            filetypes=[("Excel 文件", "*.xlsx *.xlsm"), ("所有文件", "*.*")],
+        )
+        if not price_file:
+            self._update_status("未选择价格表，未执行空调老/新价格填充。", "#f59e0b")
+            return
+
+        self.btn_air_price.config(state=tk.DISABLED, text="正在填充价格 / Saving / CHECK...")
+        self._update_status("正在填充基础价格、覆盖 FLD PO，并计算 CHECK...", "#7c3aed")
+
+        def _run():
+            try:
+                success, msg = fill_air_conditioning_old_new_prices(
+                    price_file,
+                    status_callback=lambda m: self.root.after(
+                        0, self._update_status, m, "#7c3aed"
+                    ),
+                )
+                self.root.after(0, lambda: self._air_price_done(success, msg))
+            except Exception as exc:
+                err_msg = f"错误：\n{exc}\n\n{traceback.format_exc()}"
+                self.root.after(0, lambda: self._air_price_done(False, err_msg))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _air_price_done(self, success, msg):
+        self.btn_air_price.config(state=tk.NORMAL, text="⑥ 填充空调老/新价格")
+        if success:
+            self._update_status("空调基础价格、FLD PO Saving 与 CHECK 填充完成！", "#27ae60")
+            self._show_copyable_dialog("✅ 空调价格填充报告", msg)
+        else:
+            self._update_status("空调价格填充失败，见弹窗", "#e74c3c")
+            self._show_copyable_dialog("❌ 空调价格填充失败", msg, is_error=True)
 
     def _done(self, success, msg):
-        self.btn.config(state=tk.NORMAL, text="生成装潢透视表")
+        label = CATEGORIES[self.active_category]["label"]
+        self.btn.config(state=tk.NORMAL, text=f"① 生成{label}透视表")
         if success:
-            self._update_status("生成成功！", "#27ae60")
-            messagebox.showinfo("操作成功", msg)
+            self._update_status(f"[{label}] 生成成功！", "#27ae60")
+            self._show_copyable_dialog("✅ 操作成功", msg)
         else:
-            self._update_status("生成失败，见弹窗", "#e74c3c")
-            messagebox.showerror("操作失败", msg)
+            self._update_status(f"[{label}] 生成失败，见弹窗", "#e74c3c")
+            self._show_copyable_dialog("❌ 操作失败", msg, is_error=True)
 
 
 # ═══════════════════ 入口 ═══════════════════

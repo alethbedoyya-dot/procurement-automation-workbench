@@ -1,22 +1,43 @@
-# === 敏感文件 ===
+# 登录凭据与本地环境
 auth.json
-
-# === 浏览器配置（含 cookies/缓存/历史） ===
+.env
+.env.*
+!.env.example
+*.pem
+*.key
 browser_profile/
 
-# === 下载的附件（体积大，非源码） ===
+# 业务输入、下载附件与阶段性结果（均不公开）
 downloads/
-
-# === Python 编译缓存 ===
-__pycache__/
-*.pyc
-*.pyo
-
-# === 数据文件（非源码） ===
 *.xlsx
+*.xls
 *.xlsm
 *.msg
+*.eml
 *.pdf
+**/待回填任务.json
+**/已完成回填任务_*.json
 
-# === 编辑器个人配置 ===
+# 运行日志、诊断报告与本地计划草稿
+automation_run_log.txt
+backfill_run_log.txt
+page_scan.txt
+PM匹配报告.txt
+*.log
+tasks/
+# 这两类记录含公司环境的 PO/页面诊断证据，仅本地留存
+问题记录_*.md
+浏览器自动化_*.md
+
+# 手工备份已由 Git 历史和标签替代
+*.bak
+*_backup.py
+
+# Python 与编辑器缓存
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
 .vscode/
