@@ -27,7 +27,7 @@ import traceback
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from tkinter import ttk
+import ttkbootstrap as ttk
 
 
 # ═══════════════════ 配置区 ═══════════════════
@@ -44,6 +44,7 @@ FACTORY_FILE = os.path.join(SCRIPT_DIR, "工厂清单 7.XLSX")
 
 # 通用 Sheet 名称
 SOURCE_SHEET = "Sheet1"                  # 数据源（主数据所在 Sheet）
+WORKBENCH_THEME = "flatly"
 
 # 透视表结构（所有品类通用）
 ROW_FIELDS = ["区域", "分公司", "供应商名称", "采购凭证"]
@@ -1655,13 +1656,10 @@ class PivotTableApp:
         )
 
     def _update_category_buttons(self):
-        active_color = "#2f80ed"
-        inactive_color = "#243b53"
         for cat, btn in self.cat_buttons.items():
-            if cat == self.active_category:
-                btn.config(bg=active_color, fg="#ffffff")
-            else:
-                btn.config(bg=inactive_color, fg="#bfd3e6")
+            btn.config(
+                bootstyle="primary" if cat == self.active_category else "secondary-outline"
+            )
 
     def _update_button_labels(self):
         label = CATEGORIES[self.active_category]["label"]
@@ -1733,14 +1731,10 @@ class PivotTableApp:
         for i, cat_key in enumerate(categories_order):
             cat_cfg = CATEGORIES[cat_key]
             is_active = (cat_key == self.active_category)
-            btn = tk.Button(
+            btn = ttk.Button(
                 cat_frame, text=f"  {cat_cfg['label']}  ",
-                font=("Microsoft YaHei", 10, "bold"),
-                bg="#2f80ed" if is_active else "#243b53",
-                fg="#ffffff" if is_active else "#bfd3e6",
-                activebackground="#4c9aff", activeforeground="#ffffff",
-                relief=tk.FLAT, padx=18, pady=7,
-                cursor="hand2", borderwidth=0, highlightthickness=0,
+                bootstyle="primary" if is_active else "secondary-outline",
+                padding=(18, 7),
                 command=lambda c=cat_key: self._switch_category(c),
             )
             btn.pack(side=tk.LEFT, padx=(0 if i == 0 else 4, 0))
@@ -1749,26 +1743,20 @@ class PivotTableApp:
         # 窗口控制始终独占一行，确保缩小时三个关键按钮都不会被裁掉。
         window_controls = tk.Frame(header_actions, bg="#0b2239")
         window_controls.pack(side=tk.RIGHT, padx=(0, 20), pady=4)
-        tk.Button(
-            window_controls, text="居中", font=("Microsoft YaHei", 9),
-            bg="#36516d", fg="#e8f1f8", activebackground="#4c6d8d",
-            activeforeground="#ffffff", relief=tk.FLAT, padx=12, pady=6,
-            cursor="hand2", borderwidth=0, highlightthickness=0,
+        ttk.Button(
+            window_controls, text="居中",
+            bootstyle="secondary-outline", padding=(12, 6),
             command=self._recenter_window,
         ).pack(side=tk.LEFT, padx=(0, 6))
-        self.btn_close = tk.Button(
-            window_controls, text="关闭工作台", font=("Microsoft YaHei", 9),
-            bg="#b93b4a", fg="#ffffff", activebackground="#d75061",
-            activeforeground="#ffffff", relief=tk.FLAT, padx=12, pady=6,
-            cursor="hand2", borderwidth=0, highlightthickness=0,
+        self.btn_close = ttk.Button(
+            window_controls, text="关闭工作台",
+            bootstyle="danger", padding=(12, 6),
             command=self._on_close_request,
         )
         self.btn_close.pack(side=tk.LEFT)
-        self.btn_stop_web = tk.Button(
-            window_controls, text="⏹ 停止查询", font=("Microsoft YaHei", 9, "bold"),
-            bg="#7f1d1d", fg="#f8fafc", disabledforeground="#f8fafc",
-            activebackground="#dc2626", activeforeground="#ffffff", relief=tk.FLAT, padx=12, pady=6,
-            cursor="hand2", borderwidth=0, highlightthickness=0,
+        self.btn_stop_web = ttk.Button(
+            window_controls, text="⏹ 停止查询",
+            bootstyle="danger-outline", padding=(12, 6),
             command=self._on_stop_web_click, state=tk.DISABLED,
         )
         self.btn_stop_web.pack(side=tk.LEFT, padx=(6, 0))
@@ -1816,15 +1804,11 @@ class PivotTableApp:
             ).pack(side=tk.LEFT)
             return outer, inner
 
-        def _btn(parent, text, bg_color, active_color, command):
+        def _btn(parent, text, bootstyle, command):
             """创建统一风格的按钮"""
-            btn = tk.Button(
+            btn = ttk.Button(
                 parent, text=text,
-                font=("Microsoft YaHei", 11),
-                bg=bg_color, fg="#ffffff",
-                activebackground=active_color, activeforeground="#ffffff",
-                relief=tk.FLAT, pady=10,
-                cursor="hand2", borderwidth=0, highlightthickness=0,
+                bootstyle=bootstyle, padding=(12, 9),
                 command=command,
             )
             btn.pack(fill=tk.X, padx=20, pady=(4, 0))
@@ -1853,24 +1837,21 @@ class PivotTableApp:
 
         # ── 独立按钮：匹配区域/分公司（品类无关）──
         self.btn_factory = _btn(
-            c1, "🔧 匹配区域/分公司",
-            "#f59e0b", "#fbbf24", self._on_factory_click,
+            c1, "🔧 匹配区域/分公司", "warning", self._on_factory_click,
         )
         self.hint_factory = _hint(c1, "读取工厂清单 → Sheet1 插入区域/分公司列 → 按 Plant 填值（跑一次即可）")
 
         _sep(c1)
 
         self.btn = _btn(
-            c1, f"① 生成{cfg_default['label']}透视表",
-            "#10b981", "#34d399", self._on_click,
+            c1, f"① 生成{cfg_default['label']}透视表", "success", self._on_click,
         )
         self.hint1 = _hint(c1, f"筛选物料 {cfg_default['filter_materials']} → COM 引擎生成原生透视表")
 
         _sep(c1)
 
         self.btn_extra = _btn(
-            c1, "② 添加扩展列",
-            "#3b82f6", "#60a5fa", self._on_extra_click,
+            c1, "② 添加扩展列", "primary", self._on_extra_click,
         )
         self.hint2 = _hint(c1, f"在{cfg_default['label']}透视表右侧追加 E2E项目名 / Price / PlanCost 等 9 列空白表头")
         tk.Frame(c1, bg=CARD_BG, height=10).pack()
@@ -1883,25 +1864,15 @@ class PivotTableApp:
         # 补查是另一个独立流程。
         web_action_row = tk.Frame(c2, bg=CARD_BG)
         web_action_row.pack(fill=tk.X, padx=20, pady=(4, 0))
-        self.btn_web = tk.Button(
+        self.btn_web = ttk.Button(
             web_action_row, text="③ 打开网站查询",
-            font=("Microsoft YaHei", 10),
-            bg="#6c63ff", fg="#ffffff",
-            activebackground="#8b85ff", activeforeground="#ffffff",
-            disabledforeground="#ffffff",
-            relief=tk.FLAT, pady=10,
-            cursor="hand2", borderwidth=0, highlightthickness=0,
+            bootstyle="info", padding=(12, 9),
             command=self._on_web_click,
         )
         self.btn_web.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        self.btn_retry_missing = tk.Button(
+        self.btn_retry_missing = ttk.Button(
             web_action_row, text="↻ 补查缺失 PO",
-            font=("Microsoft YaHei", 10),
-            bg="#475569", fg="#ffffff",
-            activebackground="#64748b", activeforeground="#ffffff",
-            disabledforeground="#ffffff",
-            relief=tk.FLAT, pady=10,
-            cursor="hand2", borderwidth=0, highlightthickness=0,
+            bootstyle="secondary-outline", padding=(12, 9),
             command=self._on_retry_missing_click,
         )
         self.btn_retry_missing.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
@@ -1913,16 +1884,14 @@ class PivotTableApp:
         _sep(c2)
 
         self.btn_backfill = _btn(
-            c2, "④ 回填已下载文件",
-            "#0f9d8a", "#16bda5", self._on_backfill_click,
+            c2, "④ 回填已下载文件", "success", self._on_backfill_click,
         )
         self.hint_backfill = _hint(c2, "读取已下载附件 → 解析审批价格 / 计算差异 → 写回当前品类透视表")
 
         _sep(c2)
 
         self.btn_tracking = _btn(
-            c2, "⑤ 匹配 PM Tracking",
-            "#06b6d4", "#22d3ee", self._on_tracking_click,
+            c2, "⑤ 匹配 PM Tracking", "info", self._on_tracking_click,
         )
         default_content_display = cfg_default.get("content_filter_display", cfg_default["content_filter"])
         self.hint4 = _hint(c2, f"E2E项目名模糊匹配 → Content 筛选「{default_content_display}」→ 计算 总saving / 订单是否下完")
@@ -1931,8 +1900,7 @@ class PivotTableApp:
         # ── 日志输出区 ──
         self.air_price_frame = tk.Frame(c2, bg=CARD_BG)
         self.btn_air_price = _btn(
-            self.air_price_frame, "⑥ 填充空调老/新价格",
-            "#7c3aed", "#8b5cf6", self._on_air_price_click,
+            self.air_price_frame, "⑥ 填充空调老/新价格", "primary", self._on_air_price_click,
         )
         self.hint_air_price = _hint(
             self.air_price_frame,
@@ -2081,10 +2049,9 @@ class PivotTableApp:
             font=("Microsoft YaHei", 8), fg="#7b8ca0", bg="#1a2332",
         ).pack(pady=(0, 6))
         # 关闭按钮
-        tk.Button(
-            dlg, text="关闭", font=("Microsoft YaHei", 10),
-            bg="#3b82f6", fg="#ffffff", relief=tk.FLAT, padx=30, pady=6,
-            cursor="hand2", command=_close_dialog,
+        ttk.Button(
+            dlg, text="关闭", bootstyle="primary", padding=(30, 6),
+            command=_close_dialog,
         ).pack(pady=(0, 14))
 
         # 创建后立即提高层级并请求焦点；不使用永久置顶，避免妨碍用户继续
@@ -2124,7 +2091,9 @@ class PivotTableApp:
         if self._web_stop_event is None or self._web_stop_event.is_set():
             return
         self._web_stop_event.set()
-        self.btn_stop_web.config(state=tk.DISABLED, text="⏹ 正在停止...", bg="#7f1d1d", fg="#f8fafc")
+        self.btn_stop_web.config(
+            state=tk.DISABLED, text="⏹ 正在停止...", bootstyle="danger-outline"
+        )
         self._update_status("已请求停止：当前 PO 完成后将保存已下载文件并停止后续查询。", "#ef4444")
 
     def _on_web_click(self):
@@ -2135,7 +2104,9 @@ class PivotTableApp:
         self._web_stop_event = stop_event
         self.btn_web.config(state=tk.DISABLED, text="正在查询并下载...")
         self.btn_retry_missing.config(state=tk.DISABLED, text="↻ 补查缺失 PO")
-        self.btn_stop_web.config(state=tk.NORMAL, text="⏹ 停止查询", bg="#dc2626", fg="#ffffff")
+        self.btn_stop_web.config(
+            state=tk.NORMAL, text="⏹ 停止查询", bootstyle="danger"
+        )
         self._update_status(f"[{label}] 正在启动 Edge 查询附件...", "#6c63ff")
 
         def _run():
@@ -2165,7 +2136,9 @@ class PivotTableApp:
             self._web_stop_event = None
         self.btn_web.config(state=tk.NORMAL, text="③ 打开网站查询")
         self.btn_retry_missing.config(state=tk.NORMAL, text="↻ 补查缺失 PO")
-        self.btn_stop_web.config(state=tk.DISABLED, text="⏹ 停止查询", bg="#7f1d1d", fg="#f8fafc")
+        self.btn_stop_web.config(
+            state=tk.DISABLED, text="⏹ 停止查询", bootstyle="danger-outline"
+        )
         stopped = bool(stop_event and stop_event.is_set()) or msg.startswith("⏹")
         if stopped:
             self._update_status("查询已停止；已完成的附件可直接回填。", "#f59e0b")
@@ -2185,7 +2158,9 @@ class PivotTableApp:
         self._web_stop_event = stop_event
         self.btn_web.config(state=tk.DISABLED, text="③ 打开网站查询")
         self.btn_retry_missing.config(state=tk.DISABLED, text="正在核对并补查...")
-        self.btn_stop_web.config(state=tk.NORMAL, text="⏹ 停止查询", bg="#dc2626", fg="#ffffff")
+        self.btn_stop_web.config(
+            state=tk.NORMAL, text="⏹ 停止查询", bootstyle="danger"
+        )
         self._update_status(f"[{label}] 正在核对本地 PO 目录并补查缺失项...", "#475569")
 
         def _run():
@@ -2214,7 +2189,9 @@ class PivotTableApp:
             self._web_stop_event = None
         self.btn_web.config(state=tk.NORMAL, text="③ 打开网站查询")
         self.btn_retry_missing.config(state=tk.NORMAL, text="↻ 补查缺失 PO")
-        self.btn_stop_web.config(state=tk.DISABLED, text="⏹ 停止查询", bg="#7f1d1d", fg="#f8fafc")
+        self.btn_stop_web.config(
+            state=tk.DISABLED, text="⏹ 停止查询", bootstyle="danger-outline"
+        )
         stopped = bool(stop_event and stop_event.is_set()) or msg.startswith("⏹")
         if stopped:
             self._update_status("补查已停止；已完成的附件会保留。", "#f59e0b")
@@ -2338,8 +2315,13 @@ class PivotTableApp:
 
 # ═══════════════════ 入口 ═══════════════════
 
+def create_workbench_root():
+    """创建带统一 ttkbootstrap 主题的工作台窗口。"""
+    return ttk.Window(themename=WORKBENCH_THEME)
+
+
 def main():
-    root = tk.Tk()
+    root = create_workbench_root()
     app = PivotTableApp(root)
     root.mainloop()
 
