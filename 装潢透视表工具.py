@@ -97,6 +97,21 @@ CATEGORIES = {
         "content_filter_exact_on_multiple_matches": True,
         "insert_cols_after_order": ["老价格", "新价格", "Saving"],
         "insert_col_at_end": "CHECK",
+        "price_list_sheet": "AC 25.10降价",
+    },
+    "IC卡": {
+        "label": "IC卡",
+        "filter_materials": [1000027312],
+        "data_sheet": "IC卡数据",
+        "target_sheet": "IC卡透视表",
+        "pivot_table_name": "IC卡透视表",
+        "content_filter": "IC卡",
+        "content_filter_values": ("IC卡",),
+        "content_filter_display": "IC卡",
+        "content_filter_exact_on_multiple_matches": True,
+        "insert_cols_after_order": ["老价格", "新价格", "Saving"],
+        "insert_col_at_end": "CHECK",
+        "price_list_sheet": "IC卡25.10降价",
     },
 }
 
@@ -983,12 +998,11 @@ def match_pm_tracking_data(category=None):
 
 # ═══════════════════ 主流程 ═══════════════════
 
-AIR_PRICE_LIST_SHEET = "AC 25.10降价"
-AIR_PRICE_INSTALLATION_TEXT = "安装调试费（含辅料）"
+PRICE_INSTALLATION_TEXT = "安装调试费（含辅料）"
 
 
-def fill_air_conditioning_old_new_prices(price_file, status_callback=None):
-    """填充空调价格，并用有 FLD 的 PO 汇总值覆盖其全部明细行。
+def fill_category_old_new_prices(category, price_file, status_callback=None):
+    """填充指定品类价格，并用有 FLD 的 PO 汇总值覆盖其全部明细行。
 
     常规项目仅接受“短文本 = SAP Discription-Ner”的精确匹配；这是为了
     避免名称相近时把价格写到错误物料。仅“安装调试费（含辅料）”可回退到
@@ -1005,6 +1019,12 @@ def fill_air_conditioning_old_new_prices(price_file, status_callback=None):
     """
     import math
     import openpyxl
+
+    cfg = CATEGORIES.get(category)
+    if not cfg or not cfg.get("price_list_sheet"):
+        return False, f"品类「{category}」未配置老/新价格填充。"
+    label = cfg["label"]
+    price_list_sheet = cfg["price_list_sheet"]
 
     def _status(message):
         if status_callback:
@@ -1128,26 +1148,26 @@ def fill_air_conditioning_old_new_prices(price_file, status_callback=None):
     if not os.path.exists(EXCEL_FILE):
         return False, f"找不到采购记录文件：\n{EXCEL_FILE}"
     if not price_file or not os.path.isfile(price_file):
-        return False, f"找不到空调价格表：\n{price_file or '未选择文件'}"
+        return False, f"找不到{label}价格表：\n{price_file or '未选择文件'}"
 
-    _status("正在读取空调价格表并建立精确匹配索引...")
+    _status(f"正在读取{label}价格表并建立精确匹配索引...")
     try:
         price_book = openpyxl.load_workbook(price_file, read_only=True, data_only=True)
     except Exception as exc:
-        return False, f"无法打开空调价格表：\n{exc}"
+        return False, f"无法打开{label}价格表：\n{exc}"
 
-    if AIR_PRICE_LIST_SHEET not in price_book.sheetnames:
+    if price_list_sheet not in price_book.sheetnames:
         available = "、".join(price_book.sheetnames)
         price_book.close()
         return False, (
-            f"价格表中未找到 Sheet「{AIR_PRICE_LIST_SHEET}」。\n"
+            f"价格表中未找到 Sheet「{price_list_sheet}」。\n"
             f"当前可用 Sheet：{available}"
         )
 
     price_by_sap_description = {}
     price_by_description = {}
     try:
-        price_sheet = price_book[AIR_PRICE_LIST_SHEET]
+        price_sheet = price_book[price_list_sheet]
         for row in price_sheet.iter_rows(min_row=2, values_only=True):
             if len(row) < 10:
                 continue
@@ -1166,7 +1186,7 @@ def fill_air_conditioning_old_new_prices(price_file, status_callback=None):
     except Exception as exc:
         return False, f"无法打开采购记录文件：\n{exc}"
 
-    air_cfg = CATEGORIES["空调"]
+    air_cfg = cfg
     air_data_sheet = air_cfg["data_sheet"]
     air_pivot_sheet = air_cfg["target_sheet"]
     if air_data_sheet not in workbook.sheetnames:
@@ -1252,7 +1272,7 @@ def fill_air_conditioning_old_new_prices(price_file, status_callback=None):
     for po_number in po_to_rows:
         classification = classify_downloaded_po(
             po_number,
-            category_label="空调",
+            category_label=label,
             download_dir=DOWNLOAD_DIR,
         )
         status = classification.get("status")
@@ -1319,7 +1339,7 @@ def fill_air_conditioning_old_new_prices(price_file, status_callback=None):
     unmatched_texts = set()
     ambiguous_texts = set()
 
-    _status("正在填充空调基础价格，随后计算 FLD 覆盖与 CHECK...")
+    _status(f"正在填充{label}基础价格，随后计算 FLD 覆盖与 CHECK...")
     for row_number in range(2, worksheet.max_row + 1):
         po_number = _normalise_po(worksheet.cell(row_number, po_col).value)
         if not po_number or po_number in unclassified_download_pos:
@@ -1337,7 +1357,7 @@ def fill_air_conditioning_old_new_prices(price_file, status_callback=None):
         elif primary_candidates:
             ambiguous_texts.add(short_text)
             continue
-        elif short_text == AIR_PRICE_INSTALLATION_TEXT:
+        elif short_text == PRICE_INSTALLATION_TEXT:
             # 这是唯一经业务确认的非标准名称回退，不能扩展为模糊匹配。
             fallback_candidates = price_by_description.get(short_text, [])
             price_pair = _consistent_price_pair(fallback_candidates)
@@ -1356,7 +1376,7 @@ def fill_air_conditioning_old_new_prices(price_file, status_callback=None):
         _write_merged_value(worksheet, row_number, old_price_col, price_pair[0])
         _write_merged_value(worksheet, row_number, new_price_col, price_pair[1])
 
-    _status("正在用空调透视表中的 FLD PO 汇总值覆盖全部对应明细...")
+    _status(f"正在用{label}透视表中的 FLD PO 汇总值覆盖全部对应明细...")
     fld_override_rows = 0
     for po_number, (old_value, new_value, old_number, new_number) in fld_pivot_values.items():
         saving_value = round(old_number - new_number, 2)
@@ -1434,7 +1454,7 @@ def fill_air_conditioning_old_new_prices(price_file, status_callback=None):
     workbook.close()
 
     summary = [
-        "空调老/新价格填充完成",
+        f"{label}老/新价格填充完成",
         (
             f"实际附件分类：FLD {len(fld_pos_seen)} 个 PO / "
             f"无 FLD {len(no_fld_pos_seen)} 个 PO / "
@@ -1479,8 +1499,13 @@ def fill_air_conditioning_old_new_prices(price_file, status_callback=None):
         )
     if check_skipped:
         summary.append(f"CHECK 保持原值：{check_skipped} 条缺少有效新价格或净价")
-    summary.append(f"价格表：{os.path.basename(price_file)} / {AIR_PRICE_LIST_SHEET}")
+    summary.append(f"价格表：{os.path.basename(price_file)} / {price_list_sheet}")
     return True, "\n".join(summary)
+
+
+def fill_air_conditioning_old_new_prices(price_file, status_callback=None):
+    """兼容既有空调调用入口。"""
+    return fill_category_old_new_prices("空调", price_file, status_callback)
 
 
 def generate_pivot_table(category=None, status_callback=None):
@@ -1592,7 +1617,7 @@ def fit_window_geometry(screen_width, screen_height,
 
 
 class PivotTableApp:
-    """Tkinter 主窗口 — 支持装潢/空调多品类切换"""
+    """Tkinter 主窗口 — 支持装潢、空调、IC卡多品类切换。"""
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -1679,6 +1704,8 @@ class PivotTableApp:
         self.btn_retry_missing.config(text="↻ 补查缺失 PO")
         self.btn_backfill.config(text="④ 回填已下载文件")
         self.btn_tracking.config(text="⑤ 匹配 PM Tracking")
+        if hasattr(self, "btn_air_price") and CATEGORIES[self.active_category].get("price_list_sheet"):
+            self.btn_air_price.config(text=f"⑥ 填充{label}老/新价格")
 
     def _update_hint_labels(self):
         cfg = CATEGORIES[self.active_category]
@@ -1697,15 +1724,15 @@ class PivotTableApp:
         """仅更新界面中的当前品类与操作提示，不改变任何任务逻辑。"""
         label = CATEGORIES[self.active_category]["label"]
         self.lbl_workflow_category.config(text=f"当前工作流：{label}")
-        if self.active_category == "空调":
-            hint = "推荐：① 生成透视表 → ② 添加扩展列 → ③ 查询下载 → ④ 回填 → ⑤ PM Tracking → ⑥ 填充空调老/新价格"
+        if CATEGORIES[self.active_category].get("price_list_sheet"):
+            hint = f"推荐：① 生成透视表 → ② 添加扩展列 → ③ 查询下载 → ④ 回填 → ⑤ PM Tracking → ⑥ 填充{label}老/新价格"
         else:
             hint = "推荐：① 生成透视表 → ② 添加扩展列 → ③ 查询下载 → ④ 回填 → ⑤ PM Tracking"
         self.lbl_workflow_hint.config(text=hint)
 
     def _update_air_price_control(self):
-        """空调专用价格步骤不出现在已完成的装潢工作流中。"""
-        if self.active_category == "空调":
+        """仅为配置了价格表的品类显示第⑥步。"""
+        if CATEGORIES[self.active_category].get("price_list_sheet"):
             if not self.air_price_frame.winfo_manager():
                 self.air_price_frame.pack(fill=tk.X)
         else:
@@ -1730,6 +1757,24 @@ class PivotTableApp:
         header_actions.pack(side=tk.BOTTOM, fill=tk.X)
         header_actions.pack_propagate(False)
 
+        # 先布局品类切换区：窗口缩小时优先保证所有业务入口可见，
+        # 品牌区仅使用剩余宽度，避免第三个品类按钮被挤出界面。
+        cat_frame = tk.Frame(header_main, bg="#102a43")
+        cat_frame.pack(side=tk.RIGHT, padx=(0, 20), pady=(18, 0))
+        self.cat_buttons = {}
+        categories_order = list(CATEGORIES.keys())
+        for i, cat_key in enumerate(categories_order):
+            cat_cfg = CATEGORIES[cat_key]
+            is_active = (cat_key == self.active_category)
+            btn = ttk.Button(
+                cat_frame, text=f"  {cat_cfg['label']}  ",
+                bootstyle="primary" if is_active else "secondary-outline",
+                padding=(18, 7),
+                command=lambda c=cat_key: self._switch_category(c),
+            )
+            btn.pack(side=tk.LEFT, padx=(0 if i == 0 else 4, 0))
+            self.cat_buttons[cat_key] = btn
+
         brand = tk.Frame(header_main, bg="#102a43")
         brand.pack(side=tk.LEFT, padx=(26, 0), pady=(16, 0))
         self.tke_header_logo = _load_tke_logo(
@@ -1748,27 +1793,10 @@ class PivotTableApp:
         )
         self.lbl_brand_context.pack(anchor=tk.W)
         tk.Label(
-            brand_text, text="装潢与空调 · 数据准备 / 查询下载 / 回填核对",
+            brand_text, text="装潢、空调、IC卡 · 数据准备 / 查询下载 / 回填核对",
             font=("Microsoft YaHei", 9),
             fg="#a9c5df", bg="#102a43",
         ).pack(anchor=tk.W, pady=(3, 0))
-
-        # 品类切换按钮组
-        cat_frame = tk.Frame(header_main, bg="#102a43")
-        cat_frame.pack(side=tk.RIGHT, padx=(0, 20), pady=(18, 0))
-        self.cat_buttons = {}
-        categories_order = list(CATEGORIES.keys())
-        for i, cat_key in enumerate(categories_order):
-            cat_cfg = CATEGORIES[cat_key]
-            is_active = (cat_key == self.active_category)
-            btn = ttk.Button(
-                cat_frame, text=f"  {cat_cfg['label']}  ",
-                bootstyle="primary" if is_active else "secondary-outline",
-                padding=(18, 7),
-                command=lambda c=cat_key: self._switch_category(c),
-            )
-            btn.pack(side=tk.LEFT, padx=(0 if i == 0 else 4, 0))
-            self.cat_buttons[cat_key] = btn
 
         # 窗口控制始终独占一行，确保缩小时三个关键按钮都不会被裁掉。
         window_controls = tk.Frame(header_actions, bg="#0b2239")
@@ -1986,7 +2014,7 @@ class PivotTableApp:
         # ── 日志输出区 ──
         self.air_price_frame = tk.Frame(c2, bg=CARD_BG)
         self.btn_air_price = _btn(
-            self.air_price_frame, "⑥ 填充空调老/新价格", "primary", self._on_air_price_click,
+            self.air_price_frame, "⑥ 填充老/新价格", "primary", self._on_air_price_click,
         )
         self.hint_air_price = _hint(
             self.air_price_frame,
@@ -2353,46 +2381,52 @@ class PivotTableApp:
             self._show_copyable_dialog("❌ 匹配失败", msg, is_error=True)
 
     def _on_air_price_click(self):
-        """选择价格表后，填充空调数据的老价格和新价格。"""
-        if self.active_category != "空调":
+        """选择价格表后，填充当前品类的老价格、新价格、Saving 与 CHECK。"""
+        category = self.active_category
+        cfg = CATEGORIES[category]
+        if not cfg.get("price_list_sheet"):
             return
+        label = cfg["label"]
 
         price_file = filedialog.askopenfilename(
             parent=self.root,
-            title="选择空调 FY25/26 价格表",
+            title=f"选择{label} FY25/26 价格表",
             initialdir=SCRIPT_DIR,
             filetypes=[("Excel 文件", "*.xlsx *.xlsm"), ("所有文件", "*.*")],
         )
         if not price_file:
-            self._update_status("未选择价格表，未执行空调老/新价格填充。", "#f59e0b")
+            self._update_status(f"未选择价格表，未执行{label}老/新价格填充。", "#f59e0b")
             return
 
         self.btn_air_price.config(state=tk.DISABLED, text="正在填充价格 / Saving / CHECK...")
-        self._update_status("正在填充基础价格、覆盖 FLD PO，并计算 CHECK...", "#7c3aed")
+        self._update_status(f"[{label}] 正在填充基础价格、覆盖 FLD PO，并计算 CHECK...", "#7c3aed")
 
         def _run():
             try:
-                success, msg = fill_air_conditioning_old_new_prices(
+                success, msg = fill_category_old_new_prices(
+                    category,
                     price_file,
                     status_callback=lambda m: self.root.after(
                         0, self._update_status, m, "#7c3aed"
                     ),
                 )
-                self.root.after(0, lambda: self._air_price_done(success, msg))
+                self.root.after(0, lambda: self._air_price_done(category, success, msg))
             except Exception as exc:
                 err_msg = f"错误：\n{exc}\n\n{traceback.format_exc()}"
-                self.root.after(0, lambda: self._air_price_done(False, err_msg))
+                self.root.after(0, lambda: self._air_price_done(category, False, err_msg))
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _air_price_done(self, success, msg):
-        self.btn_air_price.config(state=tk.NORMAL, text="⑥ 填充空调老/新价格")
+    def _air_price_done(self, category, success, msg):
+        label = CATEGORIES[category]["label"]
+        active_label = CATEGORIES[self.active_category]["label"]
+        self.btn_air_price.config(state=tk.NORMAL, text=f"⑥ 填充{active_label}老/新价格")
         if success:
-            self._update_status("空调基础价格、FLD PO Saving 与 CHECK 填充完成！", "#27ae60")
-            self._show_copyable_dialog("✅ 空调价格填充报告", msg)
+            self._update_status(f"{label}基础价格、FLD PO Saving 与 CHECK 填充完成！", "#27ae60")
+            self._show_copyable_dialog(f"✅ {label}价格填充报告", msg)
         else:
-            self._update_status("空调价格填充失败，见弹窗", "#e74c3c")
-            self._show_copyable_dialog("❌ 空调价格填充失败", msg, is_error=True)
+            self._update_status(f"{label}价格填充失败，见弹窗", "#e74c3c")
+            self._show_copyable_dialog(f"❌ {label}价格填充失败", msg, is_error=True)
 
     def _done(self, success, msg):
         label = CATEGORIES[self.active_category]["label"]

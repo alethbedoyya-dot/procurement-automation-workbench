@@ -193,21 +193,35 @@ class WorkbenchWindowTests(unittest.TestCase):
         finally:
             self._destroy_root(root)
 
-    def test_air_conditioning_price_fill_control_is_visible_only_for_air_conditioning(self):
+    def test_price_fill_control_is_visible_for_air_conditioning_and_ic_card_only(self):
         root = gui_module["create_workbench_root"]()
         root.withdraw()
         try:
             app = gui_module["PivotTableApp"](root)
+            root.geometry("640x560+20+20")
             root.deiconify()
             root.update_idletasks()
+            root.update()
 
             self.assertTrue(hasattr(app, "btn_air_price"))
             self.assertFalse(app.btn_air_price.winfo_ismapped())
+            self.assertIn("IC卡", app.cat_buttons)
+            ic_card_button = app.cat_buttons["IC卡"]
+            ic_card_left = ic_card_button.winfo_rootx() - root.winfo_rootx()
+            ic_card_right = ic_card_left + ic_card_button.winfo_width()
+            self.assertTrue(ic_card_button.winfo_ismapped())
+            self.assertLessEqual(ic_card_right, root.winfo_width())
 
             app._switch_category("空调")
             root.update_idletasks()
             self.assertTrue(app.btn_air_price.winfo_ismapped())
             self.assertEqual(app.btn_air_price.cget("text"), "⑥ 填充空调老/新价格")
+
+            app._switch_category("IC卡")
+            root.update_idletasks()
+            self.assertEqual(app.lbl_workflow_category.cget("text"), "当前工作流：IC卡")
+            self.assertTrue(app.btn_air_price.winfo_ismapped())
+            self.assertEqual(app.btn_air_price.cget("text"), "⑥ 填充IC卡老/新价格")
 
             app._switch_category("装潢")
             root.update_idletasks()
