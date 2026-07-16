@@ -28,6 +28,7 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import ttkbootstrap as ttk
+from download_period import monthly_download_dir
 
 
 # ═══════════════════ 配置区 ═══════════════════
@@ -39,7 +40,8 @@ TKE_LOGO_PATH = os.path.join(ASSETS_DIR, "tke-move-beyond.png")
 
 # 主数据文件
 EXCEL_FILE = os.path.join(SCRIPT_DIR, "采购记录0701.xlsx")
-DOWNLOAD_DIR = os.path.join(SCRIPT_DIR, "downloads")
+DOWNLOADS_ROOT_DIR = os.path.join(SCRIPT_DIR, "downloads")
+DOWNLOAD_DIR = monthly_download_dir(DOWNLOADS_ROOT_DIR)
 
 # 工厂清单（Plant → 区域 + 分公司 映射表，仅装潢品类需要）
 FACTORY_FILE = os.path.join(SCRIPT_DIR, "工厂清单 7.XLSX")

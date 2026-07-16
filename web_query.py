@@ -7,8 +7,8 @@ TKE VIEW 网站自动化查询模块
   2. Playwright 启动 Edge → 登录 TKE VIEW（Microsoft SSO，会话持久化）
   3. 逐个 PO：跳转搜索页 → 填PO号 → 查找 → 点击请求ID → 详情页
   4. 详情页提取：项目名称 / 梯台明细合计数量 / 下载全部附件
-  5. 附件分类：FLD 开头 → downloads/FLD文件/<PO号>/
-               非 FLD   → downloads/无FLD文件/<PO号>/
+  5. 附件分类：FLD 开头 → downloads/<上月数据>/<品类>/FLD文件/<PO号>/
+               非 FLD   → downloads/<上月数据>/<品类>/无FLD文件/<PO号>/
   6. FLD .msg 解析审批价格 → 计算差异 → 写回 Excel
 
 会话管理：
@@ -27,6 +27,7 @@ import traceback
 import threading
 import weakref
 from urllib.parse import parse_qs, urlparse
+from download_period import monthly_download_dir
 
 # ═══════════════════ 配置 ═══════════════════
 
@@ -38,7 +39,8 @@ SEARCH_URL = "https://view.tkelevator.com.cn/vivid/niops/purchasing/materials/se
 AUTH_FILE = os.path.join(SCRIPT_DIR, "auth.json")
 RUN_LOG_FILE = os.path.join(SCRIPT_DIR, "automation_run_log.txt")
 BACKFILL_RUN_LOG_FILE = os.path.join(SCRIPT_DIR, "backfill_run_log.txt")
-DOWNLOAD_DIR = os.path.join(SCRIPT_DIR, "downloads")
+DOWNLOADS_ROOT_DIR = os.path.join(SCRIPT_DIR, "downloads")
+DOWNLOAD_DIR = monthly_download_dir(DOWNLOADS_ROOT_DIR)
 FLD_DIR = os.path.join(DOWNLOAD_DIR, "FLD文件")
 NO_FLD_DIR = os.path.join(DOWNLOAD_DIR, "无FLD文件")
 PAGE_SCAN_FILE = os.path.join(SCRIPT_DIR, "page_scan.txt")
@@ -1149,8 +1151,8 @@ def _collect_all_attachment_links(page):
 def _download_support_files(page, log, po):
     """
     下载详情页中的全部附件，存入同一目录。
-    有 FLD 附件 → downloads/FLD文件/<PO号>/（全部文件，含非FLD）
-    无 FLD 附件 → downloads/无FLD文件/<PO号>/
+    有 FLD 附件 → downloads/<上月数据>/<品类>/FLD文件/<PO号>/（全部文件，含非FLD）
+    无 FLD 附件 → downloads/<上月数据>/<品类>/无FLD文件/<PO号>/
     返回: {fld_files: [...], non_fld_files: [...]}
     """
     fld_target = os.path.join(FLD_DIR, str(po))
