@@ -1642,17 +1642,6 @@ class PivotTableApp:
 
         self._build_ui()
 
-    def _recenter_window(self):
-        """把窗口重新放回当前屏幕的可见区域，不改变用户已调整的大小。"""
-        self.root.update_idletasks()
-        width, height, x, y = fit_window_geometry(
-            self.root.winfo_screenwidth(),
-            self.root.winfo_screenheight(),
-            desired_width=self.root.winfo_width(),
-            desired_height=self.root.winfo_height(),
-        )
-        self.root.geometry(f"{width}x{height}+{x}+{y}")
-
     def _on_close_request(self):
         """提供界面内关闭入口，并在任务运行时提醒用户。"""
         task_buttons = (
@@ -1801,11 +1790,6 @@ class PivotTableApp:
         # 窗口控制始终独占一行，确保缩小时三个关键按钮都不会被裁掉。
         window_controls = tk.Frame(header_actions, bg="#0b2239")
         window_controls.pack(side=tk.RIGHT, padx=(0, 20), pady=4)
-        ttk.Button(
-            window_controls, text="居中",
-            bootstyle="secondary-outline", padding=(12, 6),
-            command=self._recenter_window,
-        ).pack(side=tk.LEFT, padx=(0, 6))
         self.btn_close = ttk.Button(
             window_controls, text="关闭工作台",
             bootstyle="danger", padding=(12, 6),

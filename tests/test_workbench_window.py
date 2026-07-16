@@ -70,6 +70,7 @@ class WorkbenchWindowTests(unittest.TestCase):
 
             self.assertNotEqual(root.overrideredirect(), 1)
             self.assertEqual(root.resizable(), (1, 1))
+            self.assertFalse(hasattr(app, "_recenter_window"))
             self.assertTrue(hasattr(app, "btn_close"))
             self.assertEqual(app.btn_close.cget("text"), "关闭工作台")
             self.assertTrue(hasattr(app, "btn_stop_web"))
