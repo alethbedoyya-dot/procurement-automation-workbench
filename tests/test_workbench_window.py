@@ -44,6 +44,23 @@ class WorkbenchWindowTests(unittest.TestCase):
         finally:
             self._destroy_root(root)
 
+    def test_workbench_uses_the_packaged_tke_brand_in_its_window_and_header(self):
+        """最终品牌优化必须使用项目内的 TKE 标志，而不是微信临时文件。"""
+        root = gui_module["create_workbench_root"]()
+        root.withdraw()
+        try:
+            app = gui_module["PivotTableApp"](root)
+            root.deiconify()
+            root.update_idletasks()
+
+            self.assertTrue(Path(gui_module["TKE_LOGO_PATH"]).is_file())
+            self.assertIsNotNone(root._tke_window_icon)
+            self.assertTrue(app.lbl_tke_logo.winfo_ismapped())
+            self.assertEqual(app.lbl_tke_logo.cget("image"), str(app.tke_header_logo))
+            self.assertEqual(app.lbl_brand_context.cget("text"), "TKE · 采购自动化工作台")
+        finally:
+            self._destroy_root(root)
+
     def test_workbench_has_normal_window_controls_and_a_close_button(self):
         root = gui_module["create_workbench_root"]()
         root.withdraw()

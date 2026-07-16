@@ -34,6 +34,8 @@ import ttkbootstrap as ttk
 
 # 脚本所在目录（数据文件也放这里，替换同名文件即可更新）
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ASSETS_DIR = os.path.join(SCRIPT_DIR, "assets")
+TKE_LOGO_PATH = os.path.join(ASSETS_DIR, "tke-move-beyond.png")
 
 # 主数据文件
 EXCEL_FILE = os.path.join(SCRIPT_DIR, "采购记录0701.xlsx")
@@ -1723,13 +1725,23 @@ class PivotTableApp:
 
         brand = tk.Frame(header_main, bg="#102a43")
         brand.pack(side=tk.LEFT, padx=(26, 0), pady=(16, 0))
-        tk.Label(
-            brand, text="采购自动化工作台",
-            font=("Microsoft YaHei", 17, "bold"),
+        self.tke_header_logo = _load_tke_logo(
+            self.root, max_width=172, max_height=48,
+        )
+        self.lbl_tke_logo = tk.Label(
+            brand, image=self.tke_header_logo, bg="#102a43",
+        )
+        self.lbl_tke_logo.pack(side=tk.LEFT)
+        brand_text = tk.Frame(brand, bg="#102a43")
+        brand_text.pack(side=tk.LEFT, padx=(14, 0))
+        self.lbl_brand_context = tk.Label(
+            brand_text, text="TKE · 采购自动化工作台",
+            font=("Microsoft YaHei", 16, "bold"),
             fg="#ffffff", bg="#102a43",
-        ).pack(anchor=tk.W)
+        )
+        self.lbl_brand_context.pack(anchor=tk.W)
         tk.Label(
-            brand, text="数据准备 · 附件查询 · Excel 回填 · PM Tracking",
+            brand_text, text="装潢与空调 · 数据准备 / 查询下载 / 回填核对",
             font=("Microsoft YaHei", 9),
             fg="#a9c5df", bg="#102a43",
         ).pack(anchor=tk.W, pady=(3, 0))
@@ -2388,9 +2400,28 @@ class PivotTableApp:
 
 # ═══════════════════ 入口 ═══════════════════
 
+def _load_tke_logo(master, max_width=None, max_height=None):
+    """加载项目内置 TKE 标志；缺失资源时保持工作台可启动。"""
+    try:
+        image = tk.PhotoImage(master=master, file=TKE_LOGO_PATH)
+    except (OSError, tk.TclError):
+        return None
+
+    if not max_width and not max_height:
+        return image
+    width_scale = (image.width() + max_width - 1) // max_width if max_width else 1
+    height_scale = (image.height() + max_height - 1) // max_height if max_height else 1
+    scale = max(1, width_scale, height_scale)
+    return image.subsample(scale, scale)
+
+
 def create_workbench_root():
     """创建带统一 ttkbootstrap 主题的工作台窗口。"""
-    return ttk.Window(themename=WORKBENCH_THEME)
+    root = ttk.Window(themename=WORKBENCH_THEME)
+    root._tke_window_icon = _load_tke_logo(root)
+    if root._tke_window_icon is not None:
+        root.iconphoto(True, root._tke_window_icon)
+    return root
 
 
 def main():
