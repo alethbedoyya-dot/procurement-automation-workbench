@@ -113,6 +113,20 @@ CATEGORIES = {
         "insert_col_at_end": "CHECK",
         "price_list_sheet": "IC卡25.10降价",
     },
+    "监控": {
+        "label": "监控",
+        "filter_materials": [1000027313],
+        "data_sheet": "监控数据",
+        "target_sheet": "监控透视表",
+        "pivot_table_name": "监控透视表",
+        "content_filter": "监控",
+        "content_filter_values": ("监控",),
+        "content_filter_display": "监控",
+        "content_filter_exact_on_multiple_matches": True,
+        "insert_cols_after_order": ["老价格", "新价格", "Saving"],
+        "insert_col_at_end": "CHECK",
+        "price_list_sheet": "Monitor 25.10降价",
+    },
 }
 
 # 向后兼容：保留全局变量指向装潢默认配置（旧代码无参调用仍然有效）
@@ -1617,7 +1631,7 @@ def fit_window_geometry(screen_width, screen_height,
 
 
 class PivotTableApp:
-    """Tkinter 主窗口 — 支持装潢、空调、IC卡多品类切换。"""
+    """Tkinter 主窗口 — 支持装潢、空调、IC卡、监控多品类切换。"""
 
     def __init__(self, root: tk.Tk):
         self.root = root

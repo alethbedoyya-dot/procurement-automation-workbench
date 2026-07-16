@@ -215,7 +215,7 @@ class WorkbenchWindowTests(unittest.TestCase):
         finally:
             self._destroy_root(root)
 
-    def test_price_fill_control_is_visible_for_air_conditioning_and_ic_card_only(self):
+    def test_price_fill_control_is_visible_for_all_configured_price_categories(self):
         root = gui_module["create_workbench_root"]()
         root.withdraw()
         try:
@@ -244,6 +244,12 @@ class WorkbenchWindowTests(unittest.TestCase):
             self.assertEqual(app.lbl_workflow_category.cget("text"), "当前工作流：IC卡")
             self.assertTrue(app.btn_air_price.winfo_ismapped())
             self.assertEqual(app.btn_air_price.cget("text"), "⑥ 填充IC卡老/新价格")
+
+            app._switch_category("监控")
+            root.update_idletasks()
+            self.assertEqual(app.lbl_workflow_category.cget("text"), "当前工作流：监控")
+            self.assertTrue(app.btn_air_price.winfo_ismapped())
+            self.assertEqual(app.btn_air_price.cget("text"), "⑥ 填充监控老/新价格")
 
             app._switch_category("装潢")
             root.update_idletasks()

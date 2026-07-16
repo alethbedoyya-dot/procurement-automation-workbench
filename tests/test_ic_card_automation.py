@@ -78,6 +78,50 @@ class ICCardAutomationTests(unittest.TestCase):
         )
         workbook.close()
 
+    def test_monitor_configuration_is_ready_for_the_shared_six_step_workflow(self):
+        cfg = self.module["CATEGORIES"]["监控"]
+
+        self.assertEqual(cfg["filter_materials"], [1000027313])
+        self.assertEqual(cfg["data_sheet"], "监控数据")
+        self.assertEqual(cfg["target_sheet"], "监控透视表")
+        self.assertEqual(cfg["content_filter_values"], ("监控",))
+        self.assertTrue(cfg["content_filter_exact_on_multiple_matches"])
+        self.assertEqual(cfg["price_list_sheet"], "Monitor 25.10降价")
+
+    def test_monitor_pm_tracking_uses_exact_monitor_content(self):
+        workbook = openpyxl.Workbook()
+        worksheet = workbook.active
+        worksheet.title = "监控透视表"
+        worksheet.append([
+            "采购凭证", "求和项:订单净值", "E2E项目名", "项目总金额(审批)",
+            "支持文件名(FLD 审批)", "Price", "PlanCost", "总saving",
+            "订单是否下完=price-订单净值",
+        ])
+        worksheet.append(["PO-MON-PM", 200, "监控项目测试", None, None, None, None, None, None])
+        workbook.save(self.excel_path)
+        workbook.close()
+
+        tracking_book = openpyxl.Workbook()
+        tracking_sheet = tracking_book.active
+        tracking_sheet.title = "Base Data"
+        tracking_sheet.append(["无关表头"])
+        tracking_sheet.append(["Project Name", "Price", "PlanCost", "Content"])
+        tracking_sheet.append(["监控项目测试采购", 500, 100, "监控"])
+        tracking_sheet.append(["监控项目测试历史", 900, 200, "监控-历史"])
+        tracking_book.save(self.tracking_path)
+        tracking_book.close()
+
+        success, _ = self.module["match_pm_tracking_data"](category="监控")
+
+        self.assertTrue(success)
+        workbook = openpyxl.load_workbook(self.excel_path, data_only=True)
+        worksheet = workbook["监控透视表"]
+        self.assertEqual(
+            tuple(worksheet.cell(2, column).value for column in range(6, 10)),
+            (500, 100, 40, 300),
+        )
+        workbook.close()
+
     def test_ic_card_pm_tracking_uses_exact_ic_card_content(self):
         workbook = openpyxl.Workbook()
         worksheet = workbook.active
