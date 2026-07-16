@@ -66,6 +66,40 @@ class WorkbenchWindowTests(unittest.TestCase):
         finally:
             self._destroy_root(root)
 
+    def test_workbench_exposes_a_category_aware_workflow_overview(self):
+        """第二步美化要明确流程，但不能移除或重排业务入口。"""
+        root = gui_module["create_workbench_root"]()
+        root.withdraw()
+        try:
+            app = gui_module["PivotTableApp"](root)
+            root.update_idletasks()
+
+            self.assertEqual(app.lbl_workflow_category.cget("text"), "当前工作流：装潢")
+            self.assertIn("01 数据准备", app.lbl_workflow_path.cget("text"))
+            self.assertIn("02 查询下载", app.lbl_workflow_path.cget("text"))
+            self.assertIn("03 回填核对", app.lbl_workflow_path.cget("text"))
+
+            app._switch_category("空调")
+            root.update_idletasks()
+            self.assertEqual(app.lbl_workflow_category.cget("text"), "当前工作流：空调")
+            self.assertIn("⑥ 填充空调老/新价格", app.lbl_workflow_hint.cget("text"))
+        finally:
+            self._destroy_root(root)
+
+    def test_workflow_overview_mirrors_existing_status_updates(self):
+        """运行状态只复用既有状态文本，不触发任何业务动作。"""
+        root = gui_module["create_workbench_root"]()
+        root.withdraw()
+        try:
+            app = gui_module["PivotTableApp"](root)
+
+            app._update_status("正在查询并下载...", "#0d6efd")
+
+            self.assertEqual(app.lbl_status.cget("text"), "正在查询并下载...")
+            self.assertEqual(app.lbl_workflow_state.cget("text"), "● 正在查询并下载...")
+        finally:
+            self._destroy_root(root)
+
     def test_stop_control_remains_visible_and_legible_at_minimum_width(self):
         root = gui_module["create_workbench_root"]()
         root.withdraw()

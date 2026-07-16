@@ -1650,6 +1650,7 @@ class PivotTableApp:
         self._update_button_labels()
         self._update_hint_labels()
         self._update_air_price_control()
+        self._update_workflow_guidance()
         self._update_status(
             f"已切换到「{CATEGORIES[category]['label']}」模式 — 按 ① → ② → ③ → ④ → ⑤ 依次完成",
             "#3b82f6"
@@ -1682,6 +1683,16 @@ class PivotTableApp:
         self.hint_backfill.config(text=f"读取「{label}」已下载附件 → 解析审批价格 / 计算差异 → 写回{label}透视表")
         content_display = cfg.get("content_filter_display", cfg["content_filter"])
         self.hint4.config(text=f"E2E项目名模糊匹配 → Content 筛选「{content_display}」→ 计算总 saving / 订单是否下完")
+
+    def _update_workflow_guidance(self):
+        """仅更新界面中的当前品类与操作提示，不改变任何任务逻辑。"""
+        label = CATEGORIES[self.active_category]["label"]
+        self.lbl_workflow_category.config(text=f"当前工作流：{label}")
+        if self.active_category == "空调":
+            hint = "推荐：① 生成透视表 → ② 添加扩展列 → ③ 查询下载 → ④ 回填 → ⑤ PM Tracking → ⑥ 填充空调老/新价格"
+        else:
+            hint = "推荐：① 生成透视表 → ② 添加扩展列 → ③ 查询下载 → ④ 回填 → ⑤ PM Tracking"
+        self.lbl_workflow_hint.config(text=hint)
 
     def _update_air_price_control(self):
         """空调专用价格步骤不出现在已完成的装潢工作流中。"""
@@ -1830,10 +1841,66 @@ class PivotTableApp:
                 fill=tk.X, padx=20, pady=8
             )
 
-        # ══════════ 卡片 1：Excel 数据处理 ══════════
+        # ══════════ 工作流概览：仅帮助用户理解顺序，不参与任何业务判断 ══════════
         cfg_default = CATEGORIES[self.active_category]
+        workflow_outer, workflow = _card(content, "推荐流程")
+        workflow_outer.pack(fill=tk.X, padx=24, pady=(18, 0))
+
+        workflow_header = tk.Frame(workflow, bg=CARD_BG)
+        workflow_header.pack(fill=tk.X, padx=20, pady=(2, 6))
+        tk.Label(
+            workflow_header, text="按顺序完成，减少遗漏与重复查询",
+            font=("Microsoft YaHei", 9), fg=HINT_FG, bg=CARD_BG,
+        ).pack(side=tk.LEFT)
+        self.lbl_workflow_category = tk.Label(
+            workflow_header, text=f"当前工作流：{cfg_default['label']}",
+            font=("Microsoft YaHei", 9, "bold"), fg="#0d6efd", bg=CARD_BG,
+        )
+        self.lbl_workflow_category.pack(side=tk.RIGHT)
+
+        workflow_steps = tk.Frame(workflow, bg=CARD_BG)
+        workflow_steps.pack(fill=tk.X, padx=20, pady=(0, 7))
+        step_specs = (
+            ("01", "数据准备", "生成透视表 · 添加扩展列", "#0d6efd"),
+            ("02", "查询下载", "网站查询 · 补查缺失 PO", "#0dcaf0"),
+            ("03", "回填核对", "回填附件 · PM Tracking", "#198754"),
+        )
+        for index, (number, title, detail, color) in enumerate(step_specs):
+            step = tk.Frame(workflow_steps, bg="#f8fafc", highlightbackground="#d9e2ec", highlightthickness=1)
+            step.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0 if index == 0 else 4, 0))
+            tk.Label(
+                step, text=number, font=("Microsoft YaHei", 9, "bold"),
+                fg="#ffffff", bg=color, width=4, pady=5,
+            ).pack(side=tk.LEFT, padx=(7, 7), pady=7)
+            step_text = tk.Frame(step, bg="#f8fafc")
+            step_text.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=6)
+            tk.Label(
+                step_text, text=title, font=("Microsoft YaHei", 9, "bold"),
+                fg=TITLE_FG, bg="#f8fafc", anchor=tk.W,
+            ).pack(fill=tk.X)
+            tk.Label(
+                step_text, text=detail, font=("Microsoft YaHei", 8),
+                fg=HINT_FG, bg="#f8fafc", anchor=tk.W,
+            ).pack(fill=tk.X)
+
+        self.lbl_workflow_path = tk.Label(
+            workflow,
+            text="01 数据准备  →  02 查询下载  →  03 回填核对",
+            font=("Microsoft YaHei", 8, "bold"), fg="#52677d", bg=CARD_BG,
+            anchor=tk.W,
+        )
+        self.lbl_workflow_path.pack(fill=tk.X, padx=22)
+        self.lbl_workflow_hint = tk.Label(
+            workflow,
+            text="推荐：① 生成透视表 → ② 添加扩展列 → ③ 查询下载 → ④ 回填 → ⑤ PM Tracking",
+            font=("Microsoft YaHei", 8), fg=HINT_FG, bg=CARD_BG,
+            anchor=tk.W, justify=tk.LEFT, wraplength=680,
+        )
+        self.lbl_workflow_hint.pack(fill=tk.X, padx=22, pady=(2, 10))
+
+        # ══════════ 卡片 1：Excel 数据处理 ══════════
         c1_outer, c1 = _card(content, "01  数据准备")
-        c1_outer.pack(fill=tk.X, padx=24, pady=(18, 0))
+        c1_outer.pack(fill=tk.X, padx=24, pady=(12, 0))
 
         # ── 独立按钮：匹配区域/分公司（品类无关）──
         self.btn_factory = _btn(
@@ -1857,7 +1924,7 @@ class PivotTableApp:
         tk.Frame(c1, bg=CARD_BG, height=10).pack()
 
         # ══════════ 卡片 2：网站查询与匹配 ══════════
-        c2_outer, c2 = _card(content, "02  网站查询与回填")
+        c2_outer, c2 = _card(content, "02  查询下载与回填核对")
         c2_outer.pack(fill=tk.X, padx=24, pady=(12, 0))
 
         # ③ 与“补查缺失 PO”并列：两者属于同一网页下载步骤，避免用户误以为
@@ -1933,6 +2000,11 @@ class PivotTableApp:
             font=("Microsoft YaHei", 8), fg="#b8d4eb", bg="#102a43",
         )
         self.lbl_status.pack(side=tk.LEFT, padx=26, pady=(6, 0))
+        self.lbl_workflow_state = tk.Label(
+            status_bar, text="● 就绪 — 请从 ① 生成透视表开始",
+            font=("Microsoft YaHei", 8, "bold"), fg="#27ae60", bg="#102a43",
+        )
+        self.lbl_workflow_state.pack(side=tk.RIGHT, padx=26, pady=(6, 0))
 
     def _on_factory_click(self):
         """点击匹配区域/分公司（品类无关）"""
@@ -1982,6 +2054,7 @@ class PivotTableApp:
 
     def _update_status(self, msg, color):
         self.lbl_status.config(text=msg, fg=color)
+        self.lbl_workflow_state.config(text=f"● {msg}", fg=color)
         # 同时写入日志区
         ts = time.strftime("%H:%M:%S")
         self._log(f"{ts}  {msg}")
