@@ -1721,14 +1721,9 @@ class PivotTableApp:
         self.hint4.config(text=f"E2E项目名模糊匹配 → Content 筛选「{content_display}」→ 计算总 saving / 订单是否下完")
 
     def _update_workflow_guidance(self):
-        """仅更新界面中的当前品类与操作提示，不改变任何任务逻辑。"""
+        """仅更新当前品类标识，不改变任何任务逻辑。"""
         label = CATEGORIES[self.active_category]["label"]
         self.lbl_workflow_category.config(text=f"当前工作流：{label}")
-        if CATEGORIES[self.active_category].get("price_list_sheet"):
-            hint = f"推荐：① 生成透视表 → ② 添加扩展列 → ③ 查询下载 → ④ 回填 → ⑤ PM Tracking → ⑥ 填充{label}老/新价格"
-        else:
-            hint = "推荐：① 生成透视表 → ② 添加扩展列 → ③ 查询下载 → ④ 回填 → ⑤ PM Tracking"
-        self.lbl_workflow_hint.config(text=hint)
 
     def _update_air_price_control(self):
         """仅为配置了价格表的品类显示第⑥步。"""
@@ -1784,19 +1779,6 @@ class PivotTableApp:
             brand, image=self.tke_header_logo, bg="#102a43",
         )
         self.lbl_tke_logo.pack(side=tk.LEFT)
-        brand_text = tk.Frame(brand, bg="#102a43")
-        brand_text.pack(side=tk.LEFT, padx=(14, 0))
-        self.lbl_brand_context = tk.Label(
-            brand_text, text="TKE · 采购自动化工作台",
-            font=("Microsoft YaHei", 16, "bold"),
-            fg="#ffffff", bg="#102a43",
-        )
-        self.lbl_brand_context.pack(anchor=tk.W)
-        tk.Label(
-            brand_text, text="装潢、空调、IC卡 · 数据准备 / 查询下载 / 回填核对",
-            font=("Microsoft YaHei", 9),
-            fg="#a9c5df", bg="#102a43",
-        ).pack(anchor=tk.W, pady=(3, 0))
 
         # 窗口控制始终独占一行，确保缩小时三个关键按钮都不会被裁掉。
         window_controls = tk.Frame(header_actions, bg="#0b2239")
@@ -1937,13 +1919,7 @@ class PivotTableApp:
             anchor=tk.W,
         )
         self.lbl_workflow_path.pack(fill=tk.X, padx=22)
-        self.lbl_workflow_hint = tk.Label(
-            workflow,
-            text="推荐：① 生成透视表 → ② 添加扩展列 → ③ 查询下载 → ④ 回填 → ⑤ PM Tracking",
-            font=("Microsoft YaHei", 8), fg=HINT_FG, bg=CARD_BG,
-            anchor=tk.W, justify=tk.LEFT, wraplength=680,
-        )
-        self.lbl_workflow_hint.pack(fill=tk.X, padx=22, pady=(2, 10))
+        tk.Frame(workflow, bg=CARD_BG, height=8).pack()
 
         # ══════════ 卡片 1：Excel 数据处理 ══════════
         c1_outer, c1 = _card(content, "01  数据准备")

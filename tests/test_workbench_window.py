@@ -44,7 +44,7 @@ class WorkbenchWindowTests(unittest.TestCase):
         finally:
             self._destroy_root(root)
 
-    def test_workbench_uses_the_packaged_tke_brand_in_its_window_and_header(self):
+    def test_workbench_uses_the_packaged_tke_brand_without_a_narrow_screen_text_clash(self):
         """最终品牌优化必须使用项目内的 TKE 标志，而不是微信临时文件。"""
         root = gui_module["create_workbench_root"]()
         root.withdraw()
@@ -57,7 +57,7 @@ class WorkbenchWindowTests(unittest.TestCase):
             self.assertIsNotNone(root._tke_window_icon)
             self.assertTrue(app.lbl_tke_logo.winfo_ismapped())
             self.assertEqual(app.lbl_tke_logo.cget("image"), str(app.tke_header_logo))
-            self.assertEqual(app.lbl_brand_context.cget("text"), "TKE · 采购自动化工作台")
+            self.assertFalse(hasattr(app, "lbl_brand_context"))
         finally:
             self._destroy_root(root)
 
@@ -99,7 +99,7 @@ class WorkbenchWindowTests(unittest.TestCase):
             app._switch_category("空调")
             root.update_idletasks()
             self.assertEqual(app.lbl_workflow_category.cget("text"), "当前工作流：空调")
-            self.assertIn("⑥ 填充空调老/新价格", app.lbl_workflow_hint.cget("text"))
+            self.assertFalse(hasattr(app, "lbl_workflow_hint"))
         finally:
             self._destroy_root(root)
 
