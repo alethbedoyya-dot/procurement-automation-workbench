@@ -2004,19 +2004,19 @@ class PivotTableApp:
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0, 5))
 
         # ── 底部状态栏 ──
-        status_bar = tk.Frame(self.root, bg="#102a43", height=32)
+        # 不固定高度：高 DPI 或中文字体行高变化时，状态文字仍须完整可见。
+        status_bar = tk.Frame(self.root, bg="#102a43")
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
-        status_bar.pack_propagate(False)
         self.lbl_status = tk.Label(
             status_bar, text="就绪 — 请按 ① → ② → ③ → ④ → ⑤ 顺序操作",
             font=("Microsoft YaHei", 8), fg="#b8d4eb", bg="#102a43",
         )
-        self.lbl_status.pack(side=tk.LEFT, padx=26, pady=(6, 0))
+        self.lbl_status.pack(side=tk.LEFT, padx=26, pady=6)
         self.lbl_workflow_state = tk.Label(
             status_bar, text="● 就绪 — 请从 ① 生成透视表开始",
             font=("Microsoft YaHei", 8, "bold"), fg="#27ae60", bg="#102a43",
         )
-        self.lbl_workflow_state.pack(side=tk.RIGHT, padx=26, pady=(6, 0))
+        self.lbl_workflow_state.pack(side=tk.RIGHT, padx=26, pady=6)
 
     def _on_factory_click(self):
         """点击匹配区域/分公司（品类无关）"""

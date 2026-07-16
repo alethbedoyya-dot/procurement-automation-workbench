@@ -117,6 +117,27 @@ class WorkbenchWindowTests(unittest.TestCase):
         finally:
             self._destroy_root(root)
 
+    def test_status_bar_keeps_text_clear_of_the_bottom_edge_at_high_dpi(self):
+        """高 DPI 下状态栏必须根据文字行高留出底部空间，不能裁字。"""
+        root = gui_module["create_workbench_root"]()
+        root.tk.call("tk", "scaling", 2.0)
+        root.withdraw()
+        try:
+            app = gui_module["PivotTableApp"](root)
+            root.deiconify()
+            root.update_idletasks()
+            root.update()
+
+            status_bar = app.lbl_status.master
+            for label in (app.lbl_status, app.lbl_workflow_state):
+                with self.subTest(label=label.cget("text")):
+                    top = label.winfo_rooty() - status_bar.winfo_rooty()
+                    bottom = top + label.winfo_height()
+                    self.assertGreaterEqual(top, 0)
+                    self.assertLess(bottom, status_bar.winfo_height())
+        finally:
+            self._destroy_root(root)
+
     def test_stop_control_remains_visible_and_legible_at_minimum_width(self):
         root = gui_module["create_workbench_root"]()
         root.withdraw()
