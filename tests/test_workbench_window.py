@@ -176,6 +176,27 @@ class WorkbenchWindowTests(unittest.TestCase):
         finally:
             self._destroy_root(root)
 
+    def test_mouse_wheel_scrolls_the_workbench_content(self):
+        root = gui_module["create_workbench_root"]()
+        root.withdraw()
+        try:
+            app = gui_module["PivotTableApp"](root)
+            root.geometry("640x420+20+20")
+            root.deiconify()
+            root.update_idletasks()
+            root.update()
+
+            initial_position = app.content_canvas.yview()[0]
+            self.assertEqual(initial_position, 0.0)
+
+            app.content_canvas.event_generate("<MouseWheel>", delta=-120)
+            root.update_idletasks()
+            root.update()
+
+            self.assertGreater(app.content_canvas.yview()[0], initial_position)
+        finally:
+            self._destroy_root(root)
+
     def test_completion_dialog_never_captures_workbench_input(self):
         """任务完成提示异常时，主工作台仍必须保持可操作。"""
         root = gui_module["create_workbench_root"]()

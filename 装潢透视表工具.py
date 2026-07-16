@@ -1677,6 +1677,24 @@ class PivotTableApp:
             return
         self.root.destroy()
 
+    def _is_content_widget(self, widget):
+        """判断事件来源是否位于可滚动的工作台正文中。"""
+        while widget is not None:
+            if widget is self.content_canvas:
+                return True
+            widget = getattr(widget, "master", None)
+        return False
+
+    def _on_content_mousewheel(self, event):
+        """Windows 鼠标滚轮：仅在正文区域滚动。"""
+        if not self._is_content_widget(event.widget):
+            return
+        delta = getattr(event, "delta", 0)
+        if not delta:
+            return
+        units = max(1, abs(int(delta)) // 120)
+        self.content_canvas.yview_scroll(-units if delta > 0 else units, "units")
+
     # ── 品类切换 ──
     def _switch_category(self, category):
         self.active_category = category
@@ -1828,6 +1846,9 @@ class PivotTableApp:
 
         content.bind("<Configure>", _refresh_scroll_region)
         self.content_canvas.bind("<Configure>", _fit_content_width)
+        # bind_all 让鼠标位于卡片、文字或按钮上方时同样可以滚动；处理函数会
+        # 限定事件来源，因此不影响页头、弹窗等其他区域。
+        self.root.bind_all("<MouseWheel>", self._on_content_mousewheel, add="+")
 
         # ── 卡片样式工厂 ──
         def _card(parent, title):
