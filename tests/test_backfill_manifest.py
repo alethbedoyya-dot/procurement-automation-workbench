@@ -3,10 +3,24 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import openpyxl
+
 import web_query
 
 
 class PendingBackfillManifestTests(unittest.TestCase):
+    def test_extracts_wbs_from_the_detail_page_header(self):
+        class DetailPage:
+            def inner_text(self, selector):
+                assert selector == "body"
+                return "VIEW编号 343130\n项目WBS No  FSSO-71380\n项目名称 测试项目"
+
+        messages = []
+        wbs = web_query._extract_wbs(DetailPage(), messages.append)
+
+        self.assertEqual(wbs, "FSSO-71380")
+        self.assertTrue(any("WBS" in message for message in messages))
+
     def test_saves_and_loads_a_manifest_for_its_own_category(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.object(web_query, "DOWNLOAD_DIR", temp_dir), patch.object(
@@ -79,6 +93,51 @@ class PendingBackfillManifestTests(unittest.TestCase):
                     if name.startswith(web_query.COMPLETED_BACKFILL_PREFIX)
                 ]
                 self.assertEqual(len(archived), 1)
+
+    def test_backfill_writes_wbs_for_results_with_and_without_fld(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            excel_path = os.path.join(temp_dir, "采购记录.xlsx")
+            workbook = openpyxl.Workbook()
+            worksheet = workbook.active
+            worksheet.title = "装潢透视表"
+            worksheet.append(["采购凭证", "WBS"])
+            worksheet.append(["4000000001", None])
+            worksheet.append(["4000000001", None])
+            worksheet.append(["4000000002", None])
+            workbook.save(excel_path)
+            workbook.close()
+
+            with patch.object(web_query, "DOWNLOAD_DIR", temp_dir), patch.object(
+                web_query, "BACKFILL_RUN_LOG_FILE", os.path.join(temp_dir, "backfill.log")
+            ), patch.object(web_query, "EXCEL_FILE", excel_path):
+                web_query._save_pending_backfill_manifest({
+                    "category_label": "装潢",
+                    "target_sheet": "装潢透视表",
+                    "results": [
+                        {
+                            "po": "4000000001",
+                            "wbs": "FSSO-71380",
+                            "fld_files": ["FLD审批.msg"],
+                        },
+                        {
+                            "po": "4000000002",
+                            "wbs": "FSSO-71381",
+                            "fld_files": [],
+                        },
+                    ],
+                })
+
+                success, _ = web_query.backfill_downloaded_results(
+                    target_sheet="装潢透视表", category_label="装潢"
+                )
+
+            self.assertTrue(success)
+            workbook = openpyxl.load_workbook(excel_path, data_only=True)
+            worksheet = workbook["装潢透视表"]
+            self.assertEqual(worksheet["B2"].value, "FSSO-71380")
+            self.assertEqual(worksheet["B3"].value, "FSSO-71380")
+            self.assertEqual(worksheet["B4"].value, "FSSO-71381")
+            workbook.close()
 
     def test_backfill_keeps_manifest_when_a_result_cannot_be_finalized(self):
         with tempfile.TemporaryDirectory() as temp_dir:

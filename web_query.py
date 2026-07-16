@@ -776,6 +776,42 @@ def _extract_project_name(page, log):
     return None
 
 
+def _extract_wbs(page, log):
+    """从详情页头部提取「项目WBS No」字段值。"""
+    try:
+        body_text = page.inner_text("body")
+    except Exception:
+        return None
+    if not body_text:
+        return None
+
+    pattern = re.compile(
+        r"项目\s*WBS\s*(?:No\.?)?\s*[：:]?\s*([A-Za-z0-9][A-Za-z0-9._/-]*)",
+        re.IGNORECASE,
+    )
+    for line in (line.strip() for line in body_text.split("\n")):
+        if "WBS" not in line.upper():
+            continue
+        match = pattern.search(line)
+        if match:
+            wbs = match.group(1).strip()
+            log(f"  项目WBS No: {wbs}")
+            return wbs
+
+    # 少数页面会把标签和值渲染为相邻两行。
+    lines = [line.strip() for line in body_text.split("\n") if line.strip()]
+    for index, line in enumerate(lines[:-1]):
+        if "WBS" not in line.upper() or "项目" not in line:
+            continue
+        candidate = lines[index + 1]
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", candidate):
+            log(f"  项目WBS No（下行）: {candidate}")
+            return candidate
+
+    log("  ⚠ 未提取到项目WBS No")
+    return None
+
+
 def _extract_order_qty(page, log):
     """
     从详情页「梯台明细」表中提取合计行的数量值。
@@ -1750,7 +1786,7 @@ def _read_order_value_from_pivot(po, target_sheet=None):
 
 def _write_to_pivot_excel(po, project_name=None, order_qty=None,
                           support_files=None, total_amount=None, order_diff=None,
-                          target_sheet=None):
+                          wbs=None, target_sheet=None):
     """
     将提取数据写回透视表 Sheet，按采购凭证行对齐。
     """
@@ -1774,6 +1810,8 @@ def _write_to_pivot_excel(po, project_name=None, order_qty=None,
         val = str(ws.cell(1, col).value or "").strip()
         if val == "E2E项目名":
             ext_cols["E2E项目名"] = col
+        elif val == "WBS":
+            ext_cols["WBS"] = col
         elif val == "E2E订单数量":
             ext_cols["E2E订单数量"] = col
         elif val == "项目总金额(审批)":
@@ -1802,6 +1840,9 @@ def _write_to_pivot_excel(po, project_name=None, order_qty=None,
     # 3. 写入数据
     filled = []
     for tr in target_rows:
+        if wbs and "WBS" in ext_cols:
+            ws.cell(tr, ext_cols["WBS"], wbs)
+            filled.append("WBS")
         if project_name and "E2E项目名" in ext_cols:
             ws.cell(tr, ext_cols["E2E项目名"], project_name)
             filled.append("E2E项目名")
@@ -2225,6 +2266,9 @@ def _process_one_po(po, context, search_page, log):
             except Exception:
                 pass
 
+            # WBS 是所有 PO 都需要回填的独立字段，不受 FLD 附件条件限制。
+            result["wbs"] = _extract_wbs(detail_page, log)
+
             # ── 5. 下载全部附件（按 PO 号分文件夹，FLD/非FLD 分类）──
             try:
                 dl_result = _download_support_files(detail_page, log, po)
@@ -2338,6 +2382,7 @@ def _finalize_po_result(result, log, target_sheet=None):
         support_files=support_files_str,
         total_amount=total_str,
         order_diff=diff_str,
+        wbs=result.get("wbs"),
         target_sheet=target_sheet,
     )
     log(f"  {excel_msg}")
@@ -2628,6 +2673,7 @@ def backfill_downloaded_results(target_sheet=None, category_label=None, status_c
     results = manifest["results"]
     finalize_success = 0
     skipped_without_fld = 0
+    wbs_backfilled = 0
     failures = []
 
     log(f"开始回填「{category}」：共 {len(results)} 个网页结果")
@@ -2637,11 +2683,21 @@ def backfill_downloaded_results(target_sheet=None, category_label=None, status_c
         log(f"━━━ [回填 {index}/{len(results)}] PO: {po} ━━━")
         if not result.get("fld_files"):
             skipped_without_fld += 1
-            log("  ⏭ 无 FLD 附件，跳过解析与 Excel 回填")
+            wbs = result.get("wbs")
+            if wbs:
+                excel_msg = _write_to_pivot_excel(
+                    po, wbs=wbs, target_sheet=ts
+                )
+                wbs_backfilled += 1
+                log(f"  无 FLD 附件，跳过附件解析；{excel_msg}")
+            else:
+                log("  ⏭ 无 FLD 附件，跳过附件解析；未取得 WBS，不写入空值")
             continue
         try:
             _finalize_po_result(result, log, target_sheet=ts)
             finalize_success += 1
+            if result.get("wbs"):
+                wbs_backfilled += 1
         except Exception as e:
             failures.append((po, str(e)))
             log(f"  ✗ 本地处理异常: {e}")
@@ -2661,11 +2717,15 @@ def backfill_downloaded_results(target_sheet=None, category_label=None, status_c
     except Exception as e:
         return False, f"Excel 回填完成，但归档待回填任务失败：\n{e}"
 
-    log(f"✅ 回填完成：成功 {finalize_success}，无 FLD 跳过 {skipped_without_fld}")
+    log(
+        f"✅ 回填完成：FLD 完整回填 {finalize_success}，"
+        f"WBS 回填 {wbs_backfilled}，无 FLD 跳过附件解析 {skipped_without_fld}"
+    )
     log(f"任务已归档: {archived_path}")
     return True, (
         f"✅ 回填完成！\n\n"
         f"回填成功: {finalize_success}\n"
+        f"WBS 回填: {wbs_backfilled}\n"
         f"无 FLD 跳过: {skipped_without_fld}\n"
         f"任务归档: {archived_path}"
     )
