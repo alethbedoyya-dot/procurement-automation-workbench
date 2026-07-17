@@ -233,6 +233,12 @@ class WorkbenchWindowTests(unittest.TestCase):
             ic_card_right = ic_card_left + ic_card_button.winfo_width()
             self.assertTrue(ic_card_button.winfo_ismapped())
             self.assertLessEqual(ic_card_right, root.winfo_width())
+            self.assertIn("LCD", app.cat_buttons)
+            lcd_button = app.cat_buttons["LCD"]
+            lcd_left = lcd_button.winfo_rootx() - root.winfo_rootx()
+            lcd_right = lcd_left + lcd_button.winfo_width()
+            self.assertTrue(lcd_button.winfo_ismapped())
+            self.assertLessEqual(lcd_right, root.winfo_width())
 
             app._switch_category("空调")
             root.update_idletasks()
@@ -250,6 +256,12 @@ class WorkbenchWindowTests(unittest.TestCase):
             self.assertEqual(app.lbl_workflow_category.cget("text"), "当前工作流：监控")
             self.assertTrue(app.btn_air_price.winfo_ismapped())
             self.assertEqual(app.btn_air_price.cget("text"), "⑥ 填充监控老/新价格")
+
+            app._switch_category("LCD")
+            root.update_idletasks()
+            self.assertEqual(app.lbl_workflow_category.cget("text"), "当前工作流：LCD")
+            self.assertTrue(app.btn_air_price.winfo_ismapped())
+            self.assertEqual(app.btn_air_price.cget("text"), "⑥ 填充LCD老/新价格")
 
             app._switch_category("装潢")
             root.update_idletasks()

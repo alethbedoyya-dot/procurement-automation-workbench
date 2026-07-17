@@ -127,6 +127,20 @@ CATEGORIES = {
         "insert_col_at_end": "CHECK",
         "price_list_sheet": "Monitor 25.10降价",
     },
+    "LCD": {
+        "label": "LCD",
+        "filter_materials": [1000027318],
+        "data_sheet": "LCD数据",
+        "target_sheet": "LCD透视表",
+        "pivot_table_name": "LCD透视表",
+        "content_filter": "LCD",
+        "content_filter_values": ("LCD",),
+        "content_filter_display": "LCD",
+        "content_filter_exact_on_multiple_matches": True,
+        "insert_cols_after_order": ["老价格", "新价格", "Saving"],
+        "insert_col_at_end": "CHECK",
+        "price_list_sheet": "LCD 2026.1月降价",
+    },
 }
 
 # 向后兼容：保留全局变量指向装潢默认配置（旧代码无参调用仍然有效）
@@ -1631,7 +1645,7 @@ def fit_window_geometry(screen_width, screen_height,
 
 
 class PivotTableApp:
-    """Tkinter 主窗口 — 支持装潢、空调、IC卡、监控多品类切换。"""
+    """Tkinter 主窗口 — 支持装潢、空调、IC卡、监控、LCD多品类切换。"""
 
     def __init__(self, root: tk.Tk):
         self.root = root
