@@ -139,6 +139,47 @@ class PendingBackfillManifestTests(unittest.TestCase):
             self.assertEqual(worksheet["B4"].value, "FSSO-71381")
             workbook.close()
 
+    def test_backfill_batches_wbs_writes_into_one_excel_load(self):
+        """无 FLD 的 WBS 回填也应整批共用同一次 Excel 加载与保存。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            excel_path = os.path.join(temp_dir, "采购记录.xlsx")
+            workbook = openpyxl.Workbook()
+            worksheet = workbook.active
+            worksheet.title = "装潢透视表"
+            worksheet.append(["采购凭证", "WBS"])
+            worksheet.append(["4000000001", None])
+            worksheet.append(["4000000002", None])
+            workbook.save(excel_path)
+            workbook.close()
+
+            with patch.object(web_query, "DOWNLOAD_DIR", temp_dir), patch.object(
+                web_query, "BACKFILL_RUN_LOG_FILE", os.path.join(temp_dir, "backfill.log")
+            ), patch.object(web_query, "EXCEL_FILE", excel_path):
+                web_query._save_pending_backfill_manifest({
+                    "category_label": "装潢",
+                    "target_sheet": "装潢透视表",
+                    "results": [
+                        {"po": "4000000001", "wbs": "FSSO-71380", "fld_files": []},
+                        {"po": "4000000002", "wbs": "FSSO-71381", "fld_files": []},
+                    ],
+                })
+
+                real_load_workbook = openpyxl.load_workbook
+                with patch.object(
+                    openpyxl, "load_workbook", wraps=real_load_workbook
+                ) as load_workbook:
+                    success, _ = web_query.backfill_downloaded_results(
+                        target_sheet="装潢透视表", category_label="装潢"
+                    )
+
+            self.assertTrue(success)
+            self.assertEqual(load_workbook.call_count, 1)
+            workbook = openpyxl.load_workbook(excel_path, data_only=True)
+            worksheet = workbook["装潢透视表"]
+            self.assertEqual(worksheet["B2"].value, "FSSO-71380")
+            self.assertEqual(worksheet["B3"].value, "FSSO-71381")
+            workbook.close()
+
     def test_backfill_keeps_manifest_when_a_result_cannot_be_finalized(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.object(web_query, "DOWNLOAD_DIR", temp_dir), patch.object(

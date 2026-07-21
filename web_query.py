@@ -1764,8 +1764,11 @@ except Exception as e:
 
 # ═══════════════════ Excel 读写 ═══════════════════
 
-def _read_order_value_from_pivot(po, target_sheet=None):
+def _read_order_value_from_pivot(po, target_sheet=None, excel_writer=None):
     """从透视表读取指定 PO 的订单净值（列B「求和项:订单净值」）。"""
+    if excel_writer is not None:
+        return excel_writer.get_order_value(po)
+
     import openpyxl
     sheet = target_sheet or TARGET_SHEET
     try:
@@ -1786,93 +1789,203 @@ def _read_order_value_from_pivot(po, target_sheet=None):
     return None
 
 
+class _PivotExcelBackfillWriter:
+    """一次打开采购记录，供按钮④整批回填时复用。"""
+
+    _EXTENSION_HEADERS = (
+        "E2E项目名",
+        "WBS",
+        "E2E订单数量",
+        "项目总金额(审批)",
+        "订单差异(单独计算)",
+        "支持文件名(FLD 审批)",
+    )
+
+    def __init__(self, target_sheet=None):
+        import openpyxl
+
+        self.sheet = target_sheet or TARGET_SHEET
+        self._workbook = None
+        self._order_value_workbook = None
+        self._order_values = None
+        self._closed = False
+        self._dirty = False
+
+        if not os.path.exists(EXCEL_FILE):
+            raise FileNotFoundError(f"Excel 文件不存在: {EXCEL_FILE}")
+
+        self._workbook = openpyxl.load_workbook(EXCEL_FILE)
+        if self.sheet not in self._workbook.sheetnames:
+            self.close()
+            raise ValueError(f"Sheet「{self.sheet}」不存在")
+
+        self._worksheet = self._workbook[self.sheet]
+        self._extension_columns = {}
+        for col in range(1, self._worksheet.max_column + 1):
+            header = str(self._worksheet.cell(1, col).value or "").strip()
+            if header in self._EXTENSION_HEADERS:
+                self._extension_columns[header] = col
+        if not self._extension_columns:
+            self.close()
+            raise ValueError("未找到扩展列，请先点击「添加扩展列」按钮")
+
+        self._po_rows = {}
+        for row in range(2, self._worksheet.max_row + 1):
+            po_str = str(self._worksheet.cell(row, 1).value or "").strip()
+            if po_str:
+                self._po_rows.setdefault(po_str, []).append(row)
+
+    def _load_order_values(self):
+        """按需读取公式的缓存值；整批最多额外打开一次只读工作簿。"""
+        if self._order_values is not None:
+            return
+
+        import openpyxl
+
+        self._order_values = {}
+        self._order_value_workbook = openpyxl.load_workbook(
+            EXCEL_FILE, data_only=True, read_only=True
+        )
+        if self.sheet not in self._order_value_workbook.sheetnames:
+            return
+
+        worksheet = self._order_value_workbook[self.sheet]
+        for row in range(2, worksheet.max_row + 1):
+            po_str = str(worksheet.cell(row, 1).value or "").strip()
+            if po_str and po_str not in self._order_values:
+                self._order_values[po_str] = worksheet.cell(row, 2).value
+
+    def get_order_value(self, po):
+        try:
+            self._load_order_values()
+        except Exception:
+            # 与原来的单 PO 读取一致：订单净值读不到时仅跳过差异计算，
+            # 不应阻断已经下载完成的附件回填。
+            return None
+        value = self._order_values.get(str(po).strip())
+        return str(value) if value is not None else None
+
+    @staticmethod
+    def _as_number_or_original(value):
+        try:
+            return float(str(value).replace(",", ""))
+        except (TypeError, ValueError):
+            return value
+
+    def write(self, po, project_name=None, order_qty=None,
+              support_files=None, total_amount=None, order_diff=None, wbs=None):
+        """把一个 PO 的数据写入内存，真正保存由 save() 统一执行。"""
+        if self._closed:
+            raise RuntimeError("Excel 回填写入器已经关闭")
+
+        po_str = str(po).strip()
+        target_rows = self._po_rows.get(po_str, [])
+        if not target_rows:
+            return f"在列A中未找到采购凭证 {po_str}"
+
+        filled = []
+        for row in target_rows:
+            if wbs and "WBS" in self._extension_columns:
+                self._worksheet.cell(row, self._extension_columns["WBS"], wbs)
+                filled.append("WBS")
+            if project_name and "E2E项目名" in self._extension_columns:
+                self._worksheet.cell(
+                    row, self._extension_columns["E2E项目名"], project_name
+                )
+                filled.append("E2E项目名")
+            if order_qty and "E2E订单数量" in self._extension_columns:
+                self._worksheet.cell(
+                    row,
+                    self._extension_columns["E2E订单数量"],
+                    self._as_number_or_original(order_qty),
+                )
+                filled.append("E2E订单数量")
+            if total_amount is not None and "项目总金额(审批)" in self._extension_columns:
+                self._worksheet.cell(
+                    row,
+                    self._extension_columns["项目总金额(审批)"],
+                    self._as_number_or_original(total_amount),
+                )
+                filled.append("项目总金额(审批)")
+            if order_diff is not None and "订单差异(单独计算)" in self._extension_columns:
+                self._worksheet.cell(
+                    row,
+                    self._extension_columns["订单差异(单独计算)"],
+                    self._as_number_or_original(order_diff),
+                )
+                filled.append("订单差异(单独计算)")
+            if support_files and "支持文件名(FLD 审批)" in self._extension_columns:
+                self._worksheet.cell(
+                    row,
+                    self._extension_columns["支持文件名(FLD 审批)"],
+                    support_files,
+                )
+                filled.append("支持文件名(FLD 审批)")
+
+        if filled:
+            self._dirty = True
+        return f"已写入 {len(target_rows)} 行（PO {po_str}）：{', '.join(filled)}"
+
+    def save(self):
+        """只有实际写入过数据时才保存，避免无意义的整本文件重写。"""
+        if self._dirty:
+            self._workbook.save(EXCEL_FILE)
+            self._dirty = False
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        if self._order_value_workbook is not None:
+            try:
+                self._order_value_workbook.close()
+            except Exception:
+                pass
+        if self._workbook is not None:
+            try:
+                self._workbook.close()
+            except Exception:
+                pass
+
+
 def _write_to_pivot_excel(po, project_name=None, order_qty=None,
                           support_files=None, total_amount=None, order_diff=None,
-                          wbs=None, target_sheet=None):
+                          wbs=None, target_sheet=None, excel_writer=None):
     """
     将提取数据写回透视表 Sheet，按采购凭证行对齐。
     """
-    import openpyxl
+    if excel_writer is not None:
+        return excel_writer.write(
+            po,
+            project_name=project_name,
+            order_qty=order_qty,
+            support_files=support_files,
+            total_amount=total_amount,
+            order_diff=order_diff,
+            wbs=wbs,
+        )
 
-    sheet = target_sheet or TARGET_SHEET
+    try:
+        writer = _PivotExcelBackfillWriter(target_sheet=target_sheet)
+    except Exception as e:
+        return str(e)
 
-    if not os.path.exists(EXCEL_FILE):
-        return f"Excel 文件不存在: {EXCEL_FILE}"
-
-    wb = openpyxl.load_workbook(EXCEL_FILE)
-    if sheet not in wb.sheetnames:
-        wb.close()
-        return f"Sheet「{sheet}」不存在"
-
-    ws = wb[sheet]
-
-    # 1. 扫描第 1 行定位扩展列
-    ext_cols = {}
-    for col in range(1, ws.max_column + 1):
-        val = str(ws.cell(1, col).value or "").strip()
-        if val == "E2E项目名":
-            ext_cols["E2E项目名"] = col
-        elif val == "WBS":
-            ext_cols["WBS"] = col
-        elif val == "E2E订单数量":
-            ext_cols["E2E订单数量"] = col
-        elif val == "项目总金额(审批)":
-            ext_cols["项目总金额(审批)"] = col
-        elif val == "订单差异(单独计算)":
-            ext_cols["订单差异(单独计算)"] = col
-        elif val == "支持文件名(FLD 审批)":
-            ext_cols["支持文件名(FLD 审批)"] = col
-
-    if not ext_cols:
-        wb.close()
-        return "未找到扩展列，请先点击「添加扩展列」按钮"
-
-    # 2. 扫描列A 找匹配 PO 的行
-    po_str = str(po).strip()
-    target_rows = []
-    for row in range(2, ws.max_row + 1):
-        val = str(ws.cell(row, 1).value or "").strip()
-        if val == po_str:
-            target_rows.append(row)
-
-    if not target_rows:
-        wb.close()
-        return f"在列A中未找到采购凭证 {po_str}"
-
-    # 3. 写入数据
-    filled = []
-    for tr in target_rows:
-        if wbs and "WBS" in ext_cols:
-            ws.cell(tr, ext_cols["WBS"], wbs)
-            filled.append("WBS")
-        if project_name and "E2E项目名" in ext_cols:
-            ws.cell(tr, ext_cols["E2E项目名"], project_name)
-            filled.append("E2E项目名")
-        if order_qty and "E2E订单数量" in ext_cols:
-            try:
-                ws.cell(tr, ext_cols["E2E订单数量"], float(str(order_qty).replace(",", "")))
-            except ValueError:
-                ws.cell(tr, ext_cols["E2E订单数量"], order_qty)
-            filled.append("E2E订单数量")
-        if total_amount is not None and "项目总金额(审批)" in ext_cols:
-            try:
-                ws.cell(tr, ext_cols["项目总金额(审批)"], float(str(total_amount).replace(",", "")))
-            except ValueError:
-                ws.cell(tr, ext_cols["项目总金额(审批)"], total_amount)
-            filled.append("项目总金额(审批)")
-        if order_diff is not None and "订单差异(单独计算)" in ext_cols:
-            try:
-                ws.cell(tr, ext_cols["订单差异(单独计算)"], float(str(order_diff).replace(",", "")))
-            except ValueError:
-                ws.cell(tr, ext_cols["订单差异(单独计算)"], order_diff)
-            filled.append("订单差异(单独计算)")
-        if support_files and "支持文件名(FLD 审批)" in ext_cols:
-            ws.cell(tr, ext_cols["支持文件名(FLD 审批)"], support_files)
-            filled.append("支持文件名(FLD 审批)")
-
-    wb.save(EXCEL_FILE)
-    wb.close()
-    return f"已写入 {len(target_rows)} 行（PO {po_str}）：{', '.join(filled)}"
+    try:
+        message = writer.write(
+            po,
+            project_name=project_name,
+            order_qty=order_qty,
+            support_files=support_files,
+            total_amount=total_amount,
+            order_diff=order_diff,
+            wbs=wbs,
+        )
+        writer.save()
+        return message
+    except Exception as e:
+        return f"Excel 写入失败: {e}"
+    finally:
+        writer.close()
 
 
 # ═══════════════════ 单 PO 处理 ═══════════════════
@@ -2307,7 +2420,9 @@ def _process_one_po(po, context, search_page, log):
         return (None, search_page)
 
 
-def _finalize_po_result(result, log, target_sheet=None):
+def _finalize_po_result(
+    result, log, target_sheet=None, excel_writer=None, excel_writer_factory=None
+):
     """
     本地处理：PDF解析 + 差异计算 + Excel写回。
     不依赖浏览器，避免 PDF 解析阻塞后续 PO 查询。
@@ -2354,7 +2469,11 @@ def _finalize_po_result(result, log, target_sheet=None):
     result["total_amount"] = total_amount
 
     # ── 读取订单净值 → 计算差异 ──
-    order_value = _read_order_value_from_pivot(po, target_sheet=target_sheet)
+    if excel_writer is None and excel_writer_factory is not None:
+        excel_writer = excel_writer_factory()
+    order_value = _read_order_value_from_pivot(
+        po, target_sheet=target_sheet, excel_writer=excel_writer
+    )
     result["order_value"] = order_value
     order_diff = None
 
@@ -2386,6 +2505,7 @@ def _finalize_po_result(result, log, target_sheet=None):
         order_diff=diff_str,
         wbs=result.get("wbs"),
         target_sheet=target_sheet,
+        excel_writer=excel_writer,
     )
     log(f"  {excel_msg}")
     log(f"  ✓ PO {po} 本地处理完成")
@@ -2677,60 +2797,96 @@ def backfill_downloaded_results(target_sheet=None, category_label=None, status_c
     skipped_without_fld = 0
     wbs_backfilled = 0
     failures = []
+    excel_writer = None
 
     log(f"开始回填「{category}」：共 {len(results)} 个网页结果")
-    for index, result in enumerate(results, 1):
-        po = result.get("po", "?")
-        log("")
-        log(f"━━━ [回填 {index}/{len(results)}] PO: {po} ━━━")
-        if not result.get("fld_files"):
-            skipped_without_fld += 1
-            wbs = result.get("wbs")
-            if wbs:
-                excel_msg = _write_to_pivot_excel(
-                    po, wbs=wbs, target_sheet=ts
-                )
-                wbs_backfilled += 1
-                log(f"  无 FLD 附件，跳过附件解析；{excel_msg}")
-            else:
-                log("  ⏭ 无 FLD 附件，跳过附件解析；未取得 WBS，不写入空值")
-            continue
-        try:
-            _finalize_po_result(result, log, target_sheet=ts)
-            finalize_success += 1
-            if result.get("wbs"):
-                wbs_backfilled += 1
-        except Exception as e:
-            failures.append((po, str(e)))
-            log(f"  ✗ 本地处理异常: {e}")
 
-    if failures:
-        log(f"⚠ 回填未完全成功，保留待回填任务以便重试：失败 {len(failures)} 个")
-        failed_pos = "、".join(str(po) for po, _ in failures[:20])
-        return False, (
-            f"⚠ 回填未完成：成功 {finalize_success}，失败 {len(failures)}，"
-            f"无 FLD 跳过 {skipped_without_fld}。\n"
-            f"失败 PO：{failed_pos}\n"
-            "待回填任务已保留，修复附件或 Excel 后可再次点击回填。"
-        )
+    def get_excel_writer():
+        nonlocal excel_writer
+        if excel_writer is None:
+            excel_writer = _PivotExcelBackfillWriter(target_sheet=ts)
+            log("已打开采购记录：本批 PO 将在内存中回填，最后统一保存")
+        return excel_writer
 
     try:
-        archived_path = _archive_pending_backfill_manifest(category)
-    except Exception as e:
-        return False, f"Excel 回填完成，但归档待回填任务失败：\n{e}"
+        for index, result in enumerate(results, 1):
+            po = result.get("po", "?")
+            log("")
+            log(f"━━━ [回填 {index}/{len(results)}] PO: {po} ━━━")
+            if not result.get("fld_files"):
+                skipped_without_fld += 1
+                wbs = result.get("wbs")
+                if wbs:
+                    try:
+                        excel_msg = _write_to_pivot_excel(
+                            po,
+                            wbs=wbs,
+                            target_sheet=ts,
+                            excel_writer=get_excel_writer(),
+                        )
+                        wbs_backfilled += 1
+                        log(f"  无 FLD 附件，跳过附件解析；{excel_msg}")
+                    except Exception as e:
+                        failures.append((po, str(e)))
+                        log(f"  ✗ WBS 回填异常: {e}")
+                else:
+                    log("  ⏭ 无 FLD 附件，跳过附件解析；未取得 WBS，不写入空值")
+                continue
+            try:
+                _finalize_po_result(
+                    result,
+                    log,
+                    target_sheet=ts,
+                    excel_writer_factory=get_excel_writer,
+                )
+                finalize_success += 1
+                if result.get("wbs"):
+                    wbs_backfilled += 1
+            except Exception as e:
+                failures.append((po, str(e)))
+                log(f"  ✗ 本地处理异常: {e}")
 
-    log(
-        f"✅ 回填完成：FLD 完整回填 {finalize_success}，"
-        f"WBS 回填 {wbs_backfilled}，无 FLD 跳过附件解析 {skipped_without_fld}"
-    )
-    log(f"任务已归档: {archived_path}")
-    return True, (
-        f"✅ 回填完成！\n\n"
-        f"回填成功: {finalize_success}\n"
-        f"WBS 回填: {wbs_backfilled}\n"
-        f"无 FLD 跳过: {skipped_without_fld}\n"
-        f"任务归档: {archived_path}"
-    )
+        if excel_writer is not None:
+            try:
+                excel_writer.save()
+                log("采购记录已统一保存")
+            except Exception as e:
+                log(f"✗ Excel 统一保存失败: {e}")
+                return False, (
+                    f"⚠ 回填数据已处理，但 Excel 保存失败：{e}\n"
+                    "待回填任务已保留，请关闭占用的采购记录文件后再次点击回填。"
+                )
+
+        if failures:
+            log(f"⚠ 回填未完全成功，保留待回填任务以便重试：失败 {len(failures)} 个")
+            failed_pos = "、".join(str(po) for po, _ in failures[:20])
+            return False, (
+                f"⚠ 回填未完成：成功 {finalize_success}，失败 {len(failures)}，"
+                f"无 FLD 跳过 {skipped_without_fld}。\n"
+                f"失败 PO：{failed_pos}\n"
+                "已完成 PO 的 Excel 数据已统一保存；待回填任务已保留，可修复后再次点击回填。"
+            )
+
+        try:
+            archived_path = _archive_pending_backfill_manifest(category)
+        except Exception as e:
+            return False, f"Excel 回填完成，但归档待回填任务失败：\n{e}"
+
+        log(
+            f"✅ 回填完成：FLD 完整回填 {finalize_success}，"
+            f"WBS 回填 {wbs_backfilled}，无 FLD 跳过附件解析 {skipped_without_fld}"
+        )
+        log(f"任务已归档: {archived_path}")
+        return True, (
+            f"✅ 回填完成！\n\n"
+            f"回填成功: {finalize_success}\n"
+            f"WBS 回填: {wbs_backfilled}\n"
+            f"无 FLD 跳过: {skipped_without_fld}\n"
+            f"任务归档: {archived_path}"
+        )
+    finally:
+        if excel_writer is not None:
+            excel_writer.close()
 
 
 def open_website_and_search(target_sheet=None, category_label=None, status_callback=None):
