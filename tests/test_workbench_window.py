@@ -227,6 +227,21 @@ class WorkbenchWindowTests(unittest.TestCase):
 
             self.assertTrue(hasattr(app, "btn_air_price"))
             self.assertFalse(app.btn_air_price.winfo_ismapped())
+            self.assertEqual(
+                list(app.cat_buttons)[:3], ["装潢", "外包板", "空调"]
+            )
+            self.assertIn("外包板", app.cat_buttons)
+            decoration_button = app.cat_buttons["装潢"]
+            outsource_button = app.cat_buttons["外包板"]
+            decoration_right = (
+                decoration_button.winfo_rootx() - root.winfo_rootx()
+                + decoration_button.winfo_width()
+            )
+            outsource_left = outsource_button.winfo_rootx() - root.winfo_rootx()
+            outsource_right = outsource_left + outsource_button.winfo_width()
+            self.assertTrue(outsource_button.winfo_ismapped())
+            self.assertGreaterEqual(outsource_left, decoration_right)
+            self.assertLessEqual(outsource_right, root.winfo_width())
             self.assertIn("IC卡", app.cat_buttons)
             ic_card_button = app.cat_buttons["IC卡"]
             ic_card_left = ic_card_button.winfo_rootx() - root.winfo_rootx()
@@ -265,6 +280,11 @@ class WorkbenchWindowTests(unittest.TestCase):
 
             app._switch_category("装潢")
             root.update_idletasks()
+            self.assertFalse(app.btn_air_price.winfo_ismapped())
+
+            app._switch_category("外包板")
+            root.update_idletasks()
+            self.assertEqual(app.lbl_workflow_category.cget("text"), "当前工作流：外包板")
             self.assertFalse(app.btn_air_price.winfo_ismapped())
         finally:
             self._destroy_root(root)

@@ -78,6 +78,52 @@ class ICCardAutomationTests(unittest.TestCase):
         )
         workbook.close()
 
+    def test_outsource_board_reuses_decoration_five_step_configuration(self):
+        cfg = self.module["CATEGORIES"]["外包板"]
+
+        self.assertEqual(cfg["filter_materials"], [1000027309])
+        self.assertEqual(cfg["data_sheet"], "外包板数据")
+        self.assertEqual(cfg["target_sheet"], "外包板透视表")
+        self.assertEqual(cfg["pivot_table_name"], "外包板透视表")
+        self.assertEqual(cfg["content_filter"], "外包板")
+        self.assertEqual(cfg["insert_cols_after_order"], [])
+        self.assertIsNone(cfg["insert_col_at_end"])
+        self.assertNotIn("price_list_sheet", cfg)
+
+    def test_outsource_board_pm_tracking_uses_outsource_content(self):
+        workbook = openpyxl.Workbook()
+        worksheet = workbook.active
+        worksheet.title = "外包板透视表"
+        worksheet.append([
+            "采购凭证", "求和项:订单净值", "E2E项目名", "项目总金额(审批)",
+            "支持文件名(FLD 审批)", "Price", "PlanCost", "总saving",
+            "订单是否下完=price-订单净值",
+        ])
+        worksheet.append(["PO-OUT-001", 200, "外包板项目测试", 500, None, None, None, None, None])
+        workbook.save(self.excel_path)
+        workbook.close()
+
+        tracking_book = openpyxl.Workbook()
+        tracking_sheet = tracking_book.active
+        tracking_sheet.title = "Base Data"
+        tracking_sheet.append(["无关表头"])
+        tracking_sheet.append(["Project Name", "Price", "PlanCost", "Content"])
+        tracking_sheet.append(["外包板项目测试采购", 500, 100, "外包板"])
+        tracking_sheet.append(["外包板项目测试装潢", 900, 200, "装潢"])
+        tracking_book.save(self.tracking_path)
+        tracking_book.close()
+
+        success, message = self.module["match_pm_tracking_data"](category="外包板")
+
+        self.assertTrue(success, message)
+        workbook = openpyxl.load_workbook(self.excel_path, data_only=True)
+        worksheet = workbook["外包板透视表"]
+        self.assertEqual(
+            tuple(worksheet.cell(2, column).value for column in range(6, 10)),
+            (500, 100, 40, 300),
+        )
+        workbook.close()
+
     def test_monitor_configuration_is_ready_for_the_shared_six_step_workflow(self):
         cfg = self.module["CATEGORIES"]["监控"]
 

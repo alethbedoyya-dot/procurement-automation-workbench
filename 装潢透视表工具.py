@@ -85,6 +85,16 @@ CATEGORIES = {
         "insert_cols_after_order": [],               # 区域/分公司已由独立按钮处理
         "insert_col_at_end": None,                   # 在 Sheet1 末尾插入的列（None=不插入）
     },
+    "外包板": {
+        "label": "外包板",
+        "filter_materials": [1000027309],
+        "data_sheet": "外包板数据",
+        "target_sheet": "外包板透视表",
+        "pivot_table_name": "外包板透视表",
+        "content_filter": "外包板",
+        "insert_cols_after_order": [],
+        "insert_col_at_end": None,
+    },
     "空调": {
         "label": "空调",
         "filter_materials": [1000027316],
@@ -1645,7 +1655,7 @@ def fit_window_geometry(screen_width, screen_height,
 
 
 class PivotTableApp:
-    """Tkinter 主窗口 — 支持装潢、空调、IC卡、监控、LCD多品类切换。"""
+    """Tkinter 主窗口 — 支持装潢、外包板、空调、IC卡、监控、LCD多品类切换。"""
 
     def __init__(self, root: tk.Tk):
         self.root = root
