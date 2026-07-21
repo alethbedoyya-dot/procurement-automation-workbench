@@ -124,6 +124,64 @@ class ICCardAutomationTests(unittest.TestCase):
         )
         workbook.close()
 
+    def test_line_tray_creates_only_data_sheet_then_fills_prices_and_saving(self):
+        workbook = openpyxl.Workbook()
+        source_sheet = workbook.active
+        source_sheet.title = "Sheet1"
+        source_sheet.append([
+            "物料", "订单净值", "短文本", "净价", "采购订单数量",
+        ])
+        source_sheet.append([1000027323, 200, "线槽物料A", 70, 2])
+        source_sheet.append([1000027323, 300, "未匹配线槽", 50, 3])
+        source_sheet.append([1000027323, 0, "线槽物料零", 0, 4])
+        source_sheet.append([1000027316, 400, "其他物料", 10, 1])
+        workbook.save(self.excel_path)
+        workbook.close()
+
+        success, message = self.module["generate_pivot_table"](category="线槽")
+
+        self.assertTrue(success, message)
+        workbook = openpyxl.load_workbook(self.excel_path, data_only=True)
+        self.assertIn("井道线槽数据", workbook.sheetnames)
+        self.assertNotIn("线槽透视表", workbook.sheetnames)
+        data_sheet = workbook["井道线槽数据"]
+        self.assertEqual(
+            [data_sheet.cell(1, column).value for column in range(1, 9)],
+            ["物料", "订单净值", "短文本", "净价", "采购订单数量", "老价格", "新价格", "Saving"],
+        )
+        self.assertEqual(data_sheet.max_row, 4)
+        workbook.close()
+
+        price_book = openpyxl.Workbook()
+        price_sheet = price_book.active
+        price_sheet.title = "井道线槽25.10降价"
+        price_sheet.append([None] * 10)
+        price_sheet.append([None, None, None, None, "线槽物料A", None, None, 100, None, 80])
+        price_sheet.append([None, None, None, None, "线槽物料零", None, None, 0, None, 0])
+        price_book.save(self.price_path)
+        price_book.close()
+
+        success, message = self.module["fill_category_old_new_prices"](
+            "线槽", str(self.price_path)
+        )
+
+        self.assertTrue(success, message)
+        workbook = openpyxl.load_workbook(self.excel_path, data_only=True)
+        data_sheet = workbook["井道线槽数据"]
+        self.assertEqual(
+            tuple(data_sheet.cell(2, column).value for column in range(6, 9)),
+            (100, 80, 60),
+        )
+        self.assertEqual(
+            tuple(data_sheet.cell(3, column).value for column in range(6, 9)),
+            (None, None, None),
+        )
+        self.assertEqual(
+            tuple(data_sheet.cell(4, column).value for column in range(6, 9)),
+            (0, 0, 0),
+        )
+        workbook.close()
+
     def test_monitor_configuration_is_ready_for_the_shared_six_step_workflow(self):
         cfg = self.module["CATEGORIES"]["监控"]
 

@@ -95,6 +95,22 @@ CATEGORIES = {
         "insert_cols_after_order": [],
         "insert_col_at_end": None,
     },
+    "线槽": {
+        "label": "线槽",
+        "filter_materials": [1000027323],
+        "data_sheet": "井道线槽数据",
+        "workflow": "data_price",
+        "required_source_columns": ["物料", "订单净值", "短文本", "净价", "采购订单数量"],
+        "data_extra_columns": ["老价格", "新价格", "Saving"],
+        "price_list_sheet": "井道线槽25.10降价",
+        "price_source_columns": {
+            "sap_description": 5,  # E=SAP Discription-Ner
+            "old_price": 8,        # H=老价格
+            "new_price": 10,       # J=新价格
+        },
+        "insert_cols_after_order": [],
+        "insert_col_at_end": None,
+    },
     "空调": {
         "label": "空调",
         "filter_materials": [1000027316],
@@ -502,6 +518,12 @@ def _enhance_and_filter(cfg, _log):
     if len(df_filtered) == 0:
         raise RuntimeError(f"[{label}] 筛选后无数据！物料 {filter_materials} 在数据中不存在。")
     _log(f"[{label}] 筛选后数据行数: {len(df_filtered)}")
+
+    # 轻量价格类只需要在品类数据 Sheet 中追加计算列，不能污染 Sheet1，
+    # 也不会为后续透视表或其他品类预先插入无关列。
+    for column_name in cfg.get("data_extra_columns", []):
+        if column_name not in df_filtered.columns:
+            df_filtered[column_name] = None
 
     # 写入品类数据 Sheet
     wb2 = openpyxl.load_workbook(EXCEL_FILE)
@@ -1039,6 +1061,171 @@ def match_pm_tracking_data(category=None):
 PRICE_INSTALLATION_TEXT = "安装调试费（含辅料）"
 
 
+def _fill_data_price_category(category, price_file, status_callback=None):
+    """填充只含数据 Sheet 的轻量品类：价格匹配 + Saving，不依赖透视表。"""
+    import math
+    import openpyxl
+
+    cfg = CATEGORIES.get(category)
+    if not cfg or cfg.get("workflow") != "data_price":
+        return False, f"品类「{category}」未配置轻量价格流程。"
+
+    label = cfg["label"]
+    data_sheet_name = cfg["data_sheet"]
+    price_list_sheet = cfg["price_list_sheet"]
+    source_columns = cfg["price_source_columns"]
+
+    def _status(message):
+        if status_callback:
+            status_callback(message)
+
+    def _normalise(value):
+        return "" if value is None else str(value).strip()
+
+    def _number(value):
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        try:
+            number = float(str(value).replace(",", "").strip())
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    if not os.path.exists(EXCEL_FILE):
+        return False, f"找不到采购记录文件：\n{EXCEL_FILE}"
+    if not price_file or not os.path.isfile(price_file):
+        return False, f"找不到{label}价格表：\n{price_file or '未选择文件'}"
+
+    _status(f"正在读取{label}价格表并按短文本建立匹配索引...")
+    try:
+        price_book = openpyxl.load_workbook(
+            price_file, read_only=True, data_only=True
+        )
+    except Exception as exc:
+        return False, f"无法打开{label}价格表：\n{exc}"
+
+    if price_list_sheet not in price_book.sheetnames:
+        available = "、".join(price_book.sheetnames)
+        price_book.close()
+        return False, (
+            f"价格表中未找到 Sheet「{price_list_sheet}」。\n"
+            f"当前可用 Sheet：{available}"
+        )
+
+    price_by_short_text = {}
+    max_source_column = max(source_columns.values())
+    try:
+        price_sheet = price_book[price_list_sheet]
+        for row in price_sheet.iter_rows(
+            min_row=2, max_col=max_source_column, values_only=True
+        ):
+            short_text = _normalise(row[source_columns["sap_description"] - 1])
+            if not short_text:
+                continue
+            old_price = row[source_columns["old_price"] - 1]
+            new_price = row[source_columns["new_price"] - 1]
+            if old_price is None or new_price is None:
+                continue
+            price_by_short_text.setdefault(short_text, set()).add(
+                (old_price, new_price)
+            )
+    finally:
+        price_book.close()
+
+    try:
+        workbook = openpyxl.load_workbook(EXCEL_FILE)
+    except Exception as exc:
+        return False, f"无法打开采购记录文件：\n{exc}"
+
+    if data_sheet_name not in workbook.sheetnames:
+        workbook.close()
+        return False, f"采购记录中未找到 Sheet「{data_sheet_name}」，请先生成线槽数据。"
+
+    worksheet = workbook[data_sheet_name]
+    headers = {
+        _normalise(worksheet.cell(1, column).value): column
+        for column in range(1, worksheet.max_column + 1)
+        if _normalise(worksheet.cell(1, column).value)
+    }
+    required_headers = (
+        "短文本", "净价", "采购订单数量", "老价格", "新价格", "Saving",
+    )
+    missing_headers = [header for header in required_headers if header not in headers]
+    if missing_headers:
+        workbook.close()
+        return False, f"「{data_sheet_name}」缺少列：{', '.join(missing_headers)}。"
+
+    short_text_col = headers["短文本"]
+    net_price_col = headers["净价"]
+    order_quantity_col = headers["采购订单数量"]
+    old_price_col = headers["老价格"]
+    new_price_col = headers["新价格"]
+    saving_col = headers["Saving"]
+
+    matched_rows = 0
+    saving_rows = 0
+    saving_skipped = 0
+    unmatched_texts = set()
+    ambiguous_texts = set()
+    _status(f"正在匹配{label}老价格、新价格并计算 Saving...")
+    for row_number in range(2, worksheet.max_row + 1):
+        short_text = _normalise(worksheet.cell(row_number, short_text_col).value)
+        if not short_text:
+            continue
+        candidates = price_by_short_text.get(short_text, set())
+        if len(candidates) == 0:
+            unmatched_texts.add(short_text)
+            continue
+        if len(candidates) > 1:
+            ambiguous_texts.add(short_text)
+            continue
+
+        old_price, new_price = next(iter(candidates))
+        worksheet.cell(row_number, old_price_col, old_price)
+        worksheet.cell(row_number, new_price_col, new_price)
+        matched_rows += 1
+
+        old_price_number = _number(old_price)
+        net_price_number = _number(worksheet.cell(row_number, net_price_col).value)
+        order_quantity_number = _number(
+            worksheet.cell(row_number, order_quantity_col).value
+        )
+        if (
+            old_price_number is None
+            or net_price_number is None
+            or order_quantity_number is None
+        ):
+            saving_skipped += 1
+            continue
+
+        saving = round(
+            (old_price_number - net_price_number) * order_quantity_number, 2
+        )
+        worksheet.cell(row_number, saving_col, 0 if saving == 0 else saving)
+        saving_rows += 1
+
+    try:
+        workbook.save(EXCEL_FILE)
+    except Exception as exc:
+        workbook.close()
+        return False, f"无法保存采购记录文件：\n{exc}"
+    workbook.close()
+
+    summary = [
+        f"{label}老/新价格与 Saving 填充完成",
+        f"短文本 → SAP Discription-Ner 匹配：{matched_rows} 行",
+        f"Saving 已计算：{saving_rows} 行（老价格 - 净价）× 采购订单数量",
+        f"价格表：{os.path.basename(price_file)} / {price_list_sheet}（H=老价格，J=新价格）",
+    ]
+    if unmatched_texts:
+        summary.append("未匹配并保持为空：" + "、".join(sorted(unmatched_texts)))
+    if ambiguous_texts:
+        summary.append("价格存在歧义，未写入：" + "、".join(sorted(ambiguous_texts)))
+    if saving_skipped:
+        summary.append(f"Saving 保持为空：{saving_skipped} 行缺少有效老价格、净价或采购订单数量")
+    return True, "\n".join(summary)
+
+
 def fill_category_old_new_prices(category, price_file, status_callback=None):
     """填充指定品类价格，并用有 FLD 的 PO 汇总值覆盖其全部明细行。
 
@@ -1061,6 +1248,8 @@ def fill_category_old_new_prices(category, price_file, status_callback=None):
     cfg = CATEGORIES.get(category)
     if not cfg or not cfg.get("price_list_sheet"):
         return False, f"品类「{category}」未配置老/新价格填充。"
+    if cfg.get("workflow") == "data_price":
+        return _fill_data_price_category(category, price_file, status_callback)
     label = cfg["label"]
     price_list_sheet = cfg["price_list_sheet"]
 
@@ -1558,8 +1747,10 @@ def generate_pivot_table(category=None, status_callback=None):
     label = cfg["label"]
     filter_materials = cfg["filter_materials"]
     data_sheet = cfg["data_sheet"]
-    target_sheet = cfg["target_sheet"]
-    pivot_table_name = cfg["pivot_table_name"]
+    is_data_price_workflow = cfg.get("workflow") == "data_price"
+    target_sheet = cfg.get("target_sheet")
+    pivot_table_name = cfg.get("pivot_table_name")
+    required_source_columns = cfg.get("required_source_columns", CHECK_COLS)
 
     # ── 1. 检查文件 ──
     if not os.path.exists(EXCEL_FILE):
@@ -1570,7 +1761,7 @@ def generate_pivot_table(category=None, status_callback=None):
     try:
         import pandas as pd
         df_head = pd.read_excel(EXCEL_FILE, sheet_name=SOURCE_SHEET, nrows=0)
-        missing = [c for c in CHECK_COLS if c not in df_head.columns]
+        missing = [c for c in required_source_columns if c not in df_head.columns]
         if missing:
             return False, (
                 f"\"{SOURCE_SHEET}\" 中缺少以下列：\n"
@@ -1587,6 +1778,19 @@ def generate_pivot_table(category=None, status_callback=None):
         total_cols, total_rows, match_debug = _enhance_and_filter(cfg, _log)
     except Exception as e:
         return False, f"数据增强/筛选失败：\n{e}"
+
+    # 线槽这一类没有透视表：筛选结果本身就是交付数据，后续只做价格匹配。
+    # 这里提前返回，确保不会启动 Excel COM，也不会意外创建空的透视表 Sheet。
+    if is_data_price_workflow:
+        return True, (
+            f"[{label}] 数据生成成功！\n\n"
+            f"筛选物料：{filter_materials}\n"
+            f"筛选后数据行数：{total_rows}\n"
+            f"目标 Sheet：\"{data_sheet}\"\n"
+            f"已新增列：老价格 / 新价格 / Saving\n\n"
+            f"本品类不生成透视表；请继续执行②，匹配价格并计算 Saving。\n\n"
+            f"════════════ 诊断信息 ════════════\n{match_debug}"
+        )
 
     # ── 4. COM 生成原生透视表 ──
     _log(f"[{label}] 正在调用 Excel 引擎生成原生透视表...")
@@ -1728,10 +1932,11 @@ class PivotTableApp:
         self._update_category_buttons()
         self._update_button_labels()
         self._update_hint_labels()
-        self._update_air_price_control()
+        self._apply_category_workflow_ui()
         self._update_workflow_guidance()
+        steps = "① → ②" if CATEGORIES[category].get("workflow") == "data_price" else "① → ② → ③ → ④ → ⑤"
         self._update_status(
-            f"已切换到「{CATEGORIES[category]['label']}」模式 — 按 ① → ② → ③ → ④ → ⑤ 依次完成",
+            f"已切换到「{CATEGORIES[category]['label']}」模式 — 按 {steps} 依次完成",
             "#3b82f6"
         )
 
@@ -1742,7 +1947,12 @@ class PivotTableApp:
             )
 
     def _update_button_labels(self):
-        label = CATEGORIES[self.active_category]["label"]
+        cfg = CATEGORIES[self.active_category]
+        label = cfg["label"]
+        if cfg.get("workflow") == "data_price":
+            self.btn.config(text=f"① 生成{label}数据")
+            self.btn_air_price.config(text=f"② 填充{label}价格并计算 Saving")
+            return
         self.btn.config(text=f"① 生成{label}透视表")
         self.btn_extra.config(text=f"② 添加扩展列")
         self.btn_web.config(text="③ 打开网站查询")
@@ -1756,6 +1966,14 @@ class PivotTableApp:
         cfg = CATEGORIES[self.active_category]
         label = cfg["label"]
         materials = cfg["filter_materials"]
+        if cfg.get("workflow") == "data_price":
+            self.hint1.config(
+                text=f"筛选物料 {materials} → 生成「{cfg['data_sheet']}」；本品类不创建透视表"
+            )
+            self.hint_air_price.config(
+                text="短文本精确匹配价格表 E 列 SAP Discription-Ner；H 列取老价格、J 列取新价格；Saving =（老价格 - 净价）× 采购订单数量"
+            )
+            return
         self.hint1.config(text=f"筛选物料 {materials} → COM 引擎生成原生透视表")
         self.hint2.config(text=f"在{label}透视表右侧追加 E2E项目名 / WBS / Price / PlanCost 等 10 列空白表头")
         self.hint3.config(
@@ -1770,13 +1988,61 @@ class PivotTableApp:
         label = CATEGORIES[self.active_category]["label"]
         self.lbl_workflow_category.config(text=f"当前工作流：{label}")
 
-    def _update_air_price_control(self):
-        """仅为配置了价格表的品类显示第⑥步。"""
-        if CATEGORIES[self.active_category].get("price_list_sheet"):
-            if not self.air_price_frame.winfo_manager():
-                self.air_price_frame.pack(fill=tk.X)
-        else:
-            self.air_price_frame.pack_forget()
+    def _apply_category_workflow_ui(self):
+        """按品类工作流显示对应按钮，线槽不暴露无关的网页/透视表操作。"""
+        cfg = CATEGORIES[self.active_category]
+        is_data_price = cfg.get("workflow") == "data_price"
+
+        # 每次先收起再按固定顺序重新布局，避免来回切换后控件顺序错乱。
+        for widget in (
+            self.btn_factory, self.hint_factory, self.c1_sep_factory,
+            self.btn, self.hint1, self.c1_sep_main,
+            self.btn_extra, self.hint2, self.c1_bottom_spacer,
+            self.web_action_row, self.hint3, self.c2_sep_web,
+            self.btn_backfill, self.hint_backfill, self.c2_sep_backfill,
+            self.btn_tracking, self.hint4, self.c2_bottom_spacer,
+            self.air_price_frame,
+        ):
+            widget.pack_forget()
+
+        if is_data_price:
+            self.workflow_outer.pack_forget()
+            self.c1_title.config(text=f"01  生成{cfg['label']}数据")
+            self.btn.pack(fill=tk.X, padx=20, pady=(4, 0))
+            self.hint1.pack(anchor=tk.W, padx=22, pady=(2, 0))
+            self.c1_bottom_spacer.pack()
+
+            self.c2_title.config(text="02  价格匹配与 Saving")
+            self.air_price_frame.pack(fill=tk.X)
+            self.c2_bottom_spacer.pack()
+            return
+
+        self.workflow_outer.pack(
+            fill=tk.X, padx=24, pady=(18, 0), before=self.c1_outer,
+        )
+        self.c1_title.config(text="01  数据准备")
+        self.btn_factory.pack(fill=tk.X, padx=20, pady=(4, 0))
+        self.hint_factory.pack(anchor=tk.W, padx=22, pady=(2, 0))
+        self.c1_sep_factory.pack(fill=tk.X, padx=20, pady=8)
+        self.btn.pack(fill=tk.X, padx=20, pady=(4, 0))
+        self.hint1.pack(anchor=tk.W, padx=22, pady=(2, 0))
+        self.c1_sep_main.pack(fill=tk.X, padx=20, pady=8)
+        self.btn_extra.pack(fill=tk.X, padx=20, pady=(4, 0))
+        self.hint2.pack(anchor=tk.W, padx=22, pady=(2, 0))
+        self.c1_bottom_spacer.pack()
+
+        self.c2_title.config(text="02  查询下载与回填核对")
+        self.web_action_row.pack(fill=tk.X, padx=20, pady=(4, 0))
+        self.hint3.pack(anchor=tk.W, padx=22, pady=(2, 0))
+        self.c2_sep_web.pack(fill=tk.X, padx=20, pady=8)
+        self.btn_backfill.pack(fill=tk.X, padx=20, pady=(4, 0))
+        self.hint_backfill.pack(anchor=tk.W, padx=22, pady=(2, 0))
+        self.c2_sep_backfill.pack(fill=tk.X, padx=20, pady=8)
+        self.btn_tracking.pack(fill=tk.X, padx=20, pady=(4, 0))
+        self.hint4.pack(anchor=tk.W, padx=22, pady=(2, 0))
+        self.c2_bottom_spacer.pack()
+        if cfg.get("price_list_sheet"):
+            self.air_price_frame.pack(fill=tk.X)
 
     def _build_ui(self):
         WIN_BG = "#eef3f8"
@@ -1880,11 +2146,13 @@ class PivotTableApp:
             inner.pack(padx=1, pady=1, fill=tk.BOTH, expand=True)
             title_row = tk.Frame(inner, bg=CARD_BG)
             title_row.pack(fill=tk.X, padx=20, pady=(13, 4))
-            tk.Label(
+            title_label = tk.Label(
                 title_row, text=title,
                 font=("Microsoft YaHei", 11, "bold"),
                 fg=TITLE_FG, bg=CARD_BG,
-            ).pack(side=tk.LEFT)
+            )
+            title_label.pack(side=tk.LEFT)
+            inner._card_title_label = title_label
             return outer, inner
 
         def _btn(parent, text, bootstyle, command):
@@ -1909,13 +2177,14 @@ class PivotTableApp:
 
         def _sep(parent):
             """细分隔线"""
-            ttk.Separator(parent, orient=tk.HORIZONTAL).pack(
-                fill=tk.X, padx=20, pady=8
-            )
+            separator = ttk.Separator(parent, orient=tk.HORIZONTAL)
+            separator.pack(fill=tk.X, padx=20, pady=8)
+            return separator
 
         # ══════════ 工作流概览：仅帮助用户理解顺序，不参与任何业务判断 ══════════
         cfg_default = CATEGORIES[self.active_category]
         workflow_outer, workflow = _card(content, "推荐流程")
+        self.workflow_outer = workflow_outer
         workflow_outer.pack(fill=tk.X, padx=24, pady=(18, 0))
 
         workflow_header = tk.Frame(workflow, bg=CARD_BG)
@@ -1966,6 +2235,8 @@ class PivotTableApp:
 
         # ══════════ 卡片 1：Excel 数据处理 ══════════
         c1_outer, c1 = _card(content, "01  数据准备")
+        self.c1_outer = c1_outer
+        self.c1_title = c1._card_title_label
         c1_outer.pack(fill=tk.X, padx=24, pady=(12, 0))
 
         # ── 独立按钮：匹配区域/分公司（品类无关）──
@@ -1974,29 +2245,32 @@ class PivotTableApp:
         )
         self.hint_factory = _hint(c1, "读取工厂清单 → Sheet1 插入区域/分公司列 → 按 Plant 填值（跑一次即可）")
 
-        _sep(c1)
+        self.c1_sep_factory = _sep(c1)
 
         self.btn = _btn(
             c1, f"① 生成{cfg_default['label']}透视表", "success", self._on_click,
         )
         self.hint1 = _hint(c1, f"筛选物料 {cfg_default['filter_materials']} → COM 引擎生成原生透视表")
 
-        _sep(c1)
+        self.c1_sep_main = _sep(c1)
 
         self.btn_extra = _btn(
             c1, "② 添加扩展列", "primary", self._on_extra_click,
         )
         self.hint2 = _hint(c1, f"在{cfg_default['label']}透视表右侧追加 E2E项目名 / WBS / Price / PlanCost 等 10 列空白表头")
-        tk.Frame(c1, bg=CARD_BG, height=10).pack()
+        self.c1_bottom_spacer = tk.Frame(c1, bg=CARD_BG, height=10)
+        self.c1_bottom_spacer.pack()
 
         # ══════════ 卡片 2：网站查询与匹配 ══════════
         c2_outer, c2 = _card(content, "02  查询下载与回填核对")
+        self.c2_title = c2._card_title_label
         c2_outer.pack(fill=tk.X, padx=24, pady=(12, 0))
 
         # ③ 与“补查缺失 PO”并列：两者属于同一网页下载步骤，避免用户误以为
         # 补查是另一个独立流程。
         web_action_row = tk.Frame(c2, bg=CARD_BG)
         web_action_row.pack(fill=tk.X, padx=20, pady=(4, 0))
+        self.web_action_row = web_action_row
         self.btn_web = ttk.Button(
             web_action_row, text="③ 打开网站查询",
             bootstyle="info", padding=(12, 9),
@@ -2014,21 +2288,22 @@ class PivotTableApp:
             "③ 首次查询下载全部 PO；若日志提示缺失，点击右侧「补查缺失 PO」仅重查缺失项（也可扫描旧运行结果）。",
         )
 
-        _sep(c2)
+        self.c2_sep_web = _sep(c2)
 
         self.btn_backfill = _btn(
             c2, "④ 回填已下载文件", "success", self._on_backfill_click,
         )
         self.hint_backfill = _hint(c2, "读取已下载附件 → 解析审批价格 / 计算差异 → 写回当前品类透视表")
 
-        _sep(c2)
+        self.c2_sep_backfill = _sep(c2)
 
         self.btn_tracking = _btn(
             c2, "⑤ 匹配 PM Tracking", "info", self._on_tracking_click,
         )
         default_content_display = cfg_default.get("content_filter_display", cfg_default["content_filter"])
         self.hint4 = _hint(c2, f"E2E项目名模糊匹配 → Content 筛选「{default_content_display}」→ 计算 总saving / 订单是否下完")
-        tk.Frame(c2, bg=CARD_BG, height=10).pack()
+        self.c2_bottom_spacer = tk.Frame(c2, bg=CARD_BG, height=10)
+        self.c2_bottom_spacer.pack()
 
         # ── 日志输出区 ──
         self.air_price_frame = tk.Frame(c2, bg=CARD_BG)
@@ -2039,6 +2314,9 @@ class PivotTableApp:
             self.air_price_frame,
             "FLD PO 用透视表覆盖；无 FLD Saving =（老价格 - 净价）× 采购订单数量；CHECK = 新价格 - 净价",
         )
+
+        # 初次启动同样走统一布局，确保装潢默认视图和后续品类切换一致。
+        self._apply_category_workflow_ui()
 
         log_frame = tk.Frame(content, bg="#102a43")
         log_frame.pack(fill=tk.BOTH, expand=True, padx=24, pady=(12, 0))
@@ -2400,7 +2678,7 @@ class PivotTableApp:
             self._show_copyable_dialog("❌ 匹配失败", msg, is_error=True)
 
     def _on_air_price_click(self):
-        """选择价格表后，填充当前品类的老价格、新价格、Saving 与 CHECK。"""
+        """选择价格表后，执行当前品类对应的价格填充流程。"""
         category = self.active_category
         cfg = CATEGORIES[category]
         if not cfg.get("price_list_sheet"):
@@ -2417,8 +2695,15 @@ class PivotTableApp:
             self._update_status(f"未选择价格表，未执行{label}老/新价格填充。", "#f59e0b")
             return
 
-        self.btn_air_price.config(state=tk.DISABLED, text="正在填充价格 / Saving / CHECK...")
-        self._update_status(f"[{label}] 正在填充基础价格、覆盖 FLD PO，并计算 CHECK...", "#7c3aed")
+        is_data_price = cfg.get("workflow") == "data_price"
+        busy_text = "正在匹配价格并计算 Saving..." if is_data_price else "正在填充价格 / Saving / CHECK..."
+        status_text = (
+            f"[{label}] 正在按短文本匹配老/新价格，并计算 Saving..."
+            if is_data_price
+            else f"[{label}] 正在填充基础价格、覆盖 FLD PO，并计算 CHECK..."
+        )
+        self.btn_air_price.config(state=tk.DISABLED, text=busy_text)
+        self._update_status(status_text, "#7c3aed")
 
         def _run():
             try:
@@ -2437,19 +2722,33 @@ class PivotTableApp:
         threading.Thread(target=_run, daemon=True).start()
 
     def _air_price_done(self, category, success, msg):
-        label = CATEGORIES[category]["label"]
-        active_label = CATEGORIES[self.active_category]["label"]
-        self.btn_air_price.config(state=tk.NORMAL, text=f"⑥ 填充{active_label}老/新价格")
+        cfg = CATEGORIES[category]
+        label = cfg["label"]
+        active_cfg = CATEGORIES[self.active_category]
+        active_label = active_cfg["label"]
+        button_text = (
+            f"② 填充{active_label}价格并计算 Saving"
+            if active_cfg.get("workflow") == "data_price"
+            else f"⑥ 填充{active_label}老/新价格"
+        )
+        self.btn_air_price.config(state=tk.NORMAL, text=button_text)
         if success:
-            self._update_status(f"{label}基础价格、FLD PO Saving 与 CHECK 填充完成！", "#27ae60")
+            complete_text = (
+                f"{label}老/新价格与 Saving 填充完成！"
+                if cfg.get("workflow") == "data_price"
+                else f"{label}基础价格、FLD PO Saving 与 CHECK 填充完成！"
+            )
+            self._update_status(complete_text, "#27ae60")
             self._show_copyable_dialog(f"✅ {label}价格填充报告", msg)
         else:
             self._update_status(f"{label}价格填充失败，见弹窗", "#e74c3c")
             self._show_copyable_dialog(f"❌ {label}价格填充失败", msg, is_error=True)
 
     def _done(self, success, msg):
-        label = CATEGORIES[self.active_category]["label"]
-        self.btn.config(state=tk.NORMAL, text=f"① 生成{label}透视表")
+        cfg = CATEGORIES[self.active_category]
+        label = cfg["label"]
+        button_text = f"① 生成{label}数据" if cfg.get("workflow") == "data_price" else f"① 生成{label}透视表"
+        self.btn.config(state=tk.NORMAL, text=button_text)
         if success:
             self._update_status(f"[{label}] 生成成功！", "#27ae60")
             self._show_copyable_dialog("✅ 操作成功", msg)
