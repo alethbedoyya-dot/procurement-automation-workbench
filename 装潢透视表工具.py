@@ -111,6 +111,22 @@ CATEGORIES = {
         "insert_cols_after_order": [],
         "insert_col_at_end": None,
     },
+    "无线五方通话": {
+        "label": "无线五方通话",
+        "filter_materials": [8001366263, 8001366265, 8001366266, 8001366267],
+        "data_sheet": "五方通话数据",
+        "workflow": "data_price",
+        "required_source_columns": ["物料", "订单净值", "短文本", "净价", "采购订单数量"],
+        "data_extra_columns": ["老价格", "新价格", "Saving"],
+        "price_list_sheet": "五方2026.05降价",
+        "price_source_columns": {
+            "sap_description": 5,  # E=SAP Discription-Ner
+            "old_price": 8,        # H=老价格
+            "new_price": 10,       # J=新价格
+        },
+        "insert_cols_after_order": [],
+        "insert_col_at_end": None,
+    },
     "空调": {
         "label": "空调",
         "filter_materials": [1000027316],
@@ -2052,7 +2068,7 @@ class PivotTableApp:
         CARD_BORDER = "#d9e2ec"
 
         # ── 顶部标题栏 ──
-        header = tk.Frame(self.root, bg="#102a43", height=132)
+        header = tk.Frame(self.root, bg="#102a43", height=180)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
         # 标题与品类切换占上行，窗口控制固定在下行。这样窗口变窄时不会让
@@ -2063,26 +2079,35 @@ class PivotTableApp:
         header_actions.pack(side=tk.BOTTOM, fill=tk.X)
         header_actions.pack_propagate(False)
 
-        # 先布局品类切换区：窗口缩小时优先保证所有业务入口可见，
-        # 品牌区仅使用剩余宽度，避免第三个品类按钮被挤出界面。
+        # 品类较多时使用两行均分布局；窄窗口也不会把最后一个入口或品牌标志
+        # 挤出可视范围。每个按钮仍是独立可点击的工作台切换入口。
         cat_frame = tk.Frame(header_main, bg="#102a43")
-        cat_frame.pack(side=tk.RIGHT, padx=(0, 20), pady=(18, 0))
+        cat_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=(0, 6))
         self.cat_buttons = {}
         categories_order = list(CATEGORIES.keys())
+        category_buttons_per_row = 4
+        for column in range(category_buttons_per_row):
+            cat_frame.grid_columnconfigure(column, weight=1)
         for i, cat_key in enumerate(categories_order):
             cat_cfg = CATEGORIES[cat_key]
             is_active = (cat_key == self.active_category)
             btn = ttk.Button(
                 cat_frame, text=f"  {cat_cfg['label']}  ",
                 bootstyle="primary" if is_active else "secondary-outline",
-                padding=(18, 7),
+                padding=(8, 5),
                 command=lambda c=cat_key: self._switch_category(c),
             )
-            btn.pack(side=tk.LEFT, padx=(0 if i == 0 else 4, 0))
+            btn.grid(
+                row=i // category_buttons_per_row,
+                column=i % category_buttons_per_row,
+                sticky=tk.EW,
+                padx=2,
+                pady=2,
+            )
             self.cat_buttons[cat_key] = btn
 
         brand = tk.Frame(header_main, bg="#102a43")
-        brand.pack(side=tk.LEFT, padx=(26, 0), pady=(16, 0))
+        brand.pack(side=tk.TOP, anchor=tk.W, padx=(26, 0), pady=(8, 0))
         self.tke_header_logo = _load_tke_logo(
             self.root, max_width=172, max_height=48,
         )

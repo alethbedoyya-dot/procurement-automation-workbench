@@ -228,7 +228,7 @@ class WorkbenchWindowTests(unittest.TestCase):
             self.assertTrue(hasattr(app, "btn_air_price"))
             self.assertFalse(app.btn_air_price.winfo_ismapped())
             self.assertEqual(
-                list(app.cat_buttons)[:4], ["装潢", "外包板", "线槽", "空调"]
+                list(app.cat_buttons)[:5], ["装潢", "外包板", "线槽", "无线五方通话", "空调"]
             )
             self.assertIn("外包板", app.cat_buttons)
             decoration_button = app.cat_buttons["装潢"]
@@ -303,6 +303,37 @@ class WorkbenchWindowTests(unittest.TestCase):
             self.assertEqual(app.btn.cget("text"), "① 生成线槽数据")
             self.assertTrue(app.btn.winfo_ismapped())
             self.assertEqual(app.btn_air_price.cget("text"), "② 填充线槽价格并计算 Saving")
+            self.assertTrue(app.btn_air_price.winfo_ismapped())
+            for widget in (
+                app.btn_factory,
+                app.btn_extra,
+                app.btn_web,
+                app.btn_retry_missing,
+                app.btn_backfill,
+                app.btn_tracking,
+            ):
+                with self.subTest(widget=widget.cget("text")):
+                    self.assertFalse(widget.winfo_ismapped())
+        finally:
+            self._destroy_root(root)
+
+    def test_five_party_call_shows_only_data_and_price_steps(self):
+        root = gui_module["create_workbench_root"]()
+        root.withdraw()
+        try:
+            app = gui_module["PivotTableApp"](root)
+            root.geometry("640x560+20+20")
+            app._switch_category("无线五方通话")
+            root.deiconify()
+            root.update_idletasks()
+            root.update()
+
+            self.assertEqual(app.btn.cget("text"), "① 生成无线五方通话数据")
+            self.assertTrue(app.btn.winfo_ismapped())
+            self.assertEqual(
+                app.btn_air_price.cget("text"),
+                "② 填充无线五方通话价格并计算 Saving",
+            )
             self.assertTrue(app.btn_air_price.winfo_ismapped())
             for widget in (
                 app.btn_factory,

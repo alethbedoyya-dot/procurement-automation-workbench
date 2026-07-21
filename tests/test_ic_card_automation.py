@@ -182,6 +182,72 @@ class ICCardAutomationTests(unittest.TestCase):
         )
         workbook.close()
 
+    def test_five_party_call_creates_only_data_sheet_then_fills_prices_and_saving(self):
+        workbook = openpyxl.Workbook()
+        source_sheet = workbook.active
+        source_sheet.title = "Sheet1"
+        source_sheet.append([
+            "物料", "订单净值", "短文本", "净价", "采购订单数量",
+        ])
+        source_sheet.append([8001366263, 200, "五方物料A", 60, 3])
+        source_sheet.append([8001366265, 300, "五方物料B", 80, 2])
+        source_sheet.append([8001366266, 400, "未匹配五方", 50, 1])
+        source_sheet.append([8001366267, 100, "五方物料零", 0, 2])
+        source_sheet.append([1000027323, 300, "其他物料", 10, 1])
+        workbook.save(self.excel_path)
+        workbook.close()
+
+        success, message = self.module["generate_pivot_table"](
+            category="无线五方通话"
+        )
+
+        self.assertTrue(success, message)
+        workbook = openpyxl.load_workbook(self.excel_path, data_only=True)
+        self.assertIn("五方通话数据", workbook.sheetnames)
+        self.assertNotIn("无线五方通话透视表", workbook.sheetnames)
+        data_sheet = workbook["五方通话数据"]
+        self.assertEqual(
+            [data_sheet.cell(1, column).value for column in range(1, 9)],
+            ["物料", "订单净值", "短文本", "净价", "采购订单数量", "老价格", "新价格", "Saving"],
+        )
+        self.assertEqual(data_sheet.max_row, 5)
+        workbook.close()
+
+        price_book = openpyxl.Workbook()
+        price_sheet = price_book.active
+        price_sheet.title = "五方2026.05降价"
+        price_sheet.append([None] * 10)
+        price_sheet.append([None, None, None, None, "五方物料A", None, None, 100, None, 80])
+        price_sheet.append([None, None, None, None, "五方物料B", None, None, 120, None, 90])
+        price_sheet.append([None, None, None, None, "五方物料零", None, None, 0, None, 0])
+        price_book.save(self.price_path)
+        price_book.close()
+
+        success, message = self.module["fill_category_old_new_prices"](
+            "无线五方通话", str(self.price_path)
+        )
+
+        self.assertTrue(success, message)
+        workbook = openpyxl.load_workbook(self.excel_path, data_only=True)
+        data_sheet = workbook["五方通话数据"]
+        self.assertEqual(
+            tuple(data_sheet.cell(2, column).value for column in range(6, 9)),
+            (100, 80, 120),
+        )
+        self.assertEqual(
+            tuple(data_sheet.cell(3, column).value for column in range(6, 9)),
+            (120, 90, 80),
+        )
+        self.assertEqual(
+            tuple(data_sheet.cell(4, column).value for column in range(6, 9)),
+            (None, None, None),
+        )
+        self.assertEqual(
+            tuple(data_sheet.cell(5, column).value for column in range(6, 9)),
+            (0, 0, 0),
+        )
+        workbook.close()
+
     def test_monitor_configuration_is_ready_for_the_shared_six_step_workflow(self):
         cfg = self.module["CATEGORIES"]["监控"]
 
