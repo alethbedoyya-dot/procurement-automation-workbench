@@ -248,6 +248,124 @@ class ICCardAutomationTests(unittest.TestCase):
         )
         workbook.close()
 
+    def test_shaft_lighting_prepares_description_and_saving_layout(self):
+        workbook = openpyxl.Workbook()
+        source_sheet = workbook.active
+        source_sheet.title = "Sheet1"
+        source_sheet.append(["物料", "订单净值", "短文本"])
+        source_sheet.append([1000027319, 100, "GL Shaft Lighting 044"])
+        source_sheet.append([1000027319, 200, "ZL Shaft Lighting 045"])
+        source_sheet.append([1000027319, 300, "AA Shaft Lighting 071"])
+        source_sheet.append([1000027318, 400, "LCD Shaft Lighting 044"])
+        workbook.save(self.excel_path)
+        workbook.close()
+
+        cfg = self.module["CATEGORIES"]["井道照明"]
+        total_cols, total_rows, _ = self.module["_enhance_and_filter"](cfg, lambda _msg: None)
+
+        self.assertEqual((total_cols, total_rows), (5, 3))
+        workbook = openpyxl.load_workbook(self.excel_path, data_only=True)
+        data_sheet = workbook["井道照明数据"]
+        self.assertEqual(
+            [data_sheet.cell(1, column).value for column in range(1, 6)],
+            ["物料", "订单净值", "短文本", "描述", "PO数量"],
+        )
+        self.assertEqual(
+            tuple(data_sheet.cell(2, column).value for column in range(4, 6)),
+            ("Shaft Lighting 044", 1),
+        )
+        self.assertEqual(
+            tuple(data_sheet.cell(3, column).value for column in range(4, 6)),
+            ("Shaft Lighting 045", 1),
+        )
+        workbook.close()
+
+        class FakeRange:
+            def __init__(self):
+                self.Value = None
+                self.Formula = None
+                self.NumberFormat = None
+                self.merged = False
+
+            def Merge(self):
+                self.merged = True
+
+        class FakeWorksheet:
+            def __init__(self):
+                self.ranges = {}
+
+            def Range(self, address):
+                return self.ranges.setdefault(address, FakeRange())
+
+        worksheet = FakeWorksheet()
+        self.module["_apply_lighting_saving_layout"](worksheet)
+
+        self.assertTrue(worksheet.ranges["I5:J5"].merged)
+        self.assertEqual(worksheet.ranges["M6"].Value, "SAP PO 数量 (=Shaft Lighting 044 + 045)")
+        self.assertEqual(
+            worksheet.ranges["N6"].Formula,
+            '=IFERROR(GETPIVOTDATA("求和项:PO数量",$A$1,"描述","Shaft Lighting 044"),0)+IFERROR(GETPIVOTDATA("求和项:PO数量",$A$1,"描述","Shaft Lighting 045"),0)',
+        )
+        self.assertEqual(worksheet.ranges["N8"].Formula, '=IFERROR(GETPIVOTDATA("求和项:PO数量",$A$1,"描述","Shaft Lighting 053"),0)-N6-N7')
+        self.assertEqual(worksheet.ranges["O6"].Formula, "=N6*L6")
+        self.assertEqual(worksheet.ranges["O12"].Formula, "=SUM(O6:O11)")
+
+    def test_shaft_lighting_uses_description_and_po_count_for_native_pivot(self):
+        workbook = openpyxl.Workbook()
+        source_sheet = workbook.active
+        source_sheet.title = "Sheet1"
+        source_sheet.append(["物料", "订单净值", "短文本"])
+        source_sheet.append([1000027319, 100, "GL Shaft Lighting 044"])
+        workbook.save(self.excel_path)
+        workbook.close()
+
+        class FakeRange:
+            def __init__(self):
+                self.Value = None
+                self.Formula = None
+                self.NumberFormat = None
+
+            def Merge(self):
+                pass
+
+        class FakeWorksheet:
+            def __init__(self):
+                self.ranges = {}
+
+            def Range(self, address):
+                return self.ranges.setdefault(address, FakeRange())
+
+        class FakeWorkbook:
+            def Save(self):
+                pass
+
+            def Close(self, **_kwargs):
+                pass
+
+        class FakeExcel:
+            def __init__(self):
+                self.Workbooks = types.SimpleNamespace(Open=lambda _path: FakeWorkbook())
+
+        captured = {}
+        pivot_sheet = FakeWorksheet()
+
+        def fake_create_pivot(*_args, **kwargs):
+            captured.update(kwargs)
+            return pivot_sheet, object()
+
+        with patch.dict(self.module_globals, {
+            "_com_start": FakeExcel,
+            "_com_stop": lambda *_args: None,
+            "_com_create_pivot": fake_create_pivot,
+        }):
+            success, message = self.module["generate_pivot_table"](category="井道照明")
+
+        self.assertTrue(success, message)
+        self.assertEqual(captured["row_fields"], ["描述"])
+        self.assertEqual(captured["value_field"], "PO数量")
+        self.assertEqual(captured["value_name"], "求和项:PO数量")
+        self.assertEqual(pivot_sheet.ranges["O6"].Formula, "=N6*L6")
+
     def test_monitor_configuration_is_ready_for_the_shared_six_step_workflow(self):
         cfg = self.module["CATEGORIES"]["监控"]
 

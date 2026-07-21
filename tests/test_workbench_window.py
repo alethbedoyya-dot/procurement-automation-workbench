@@ -228,7 +228,7 @@ class WorkbenchWindowTests(unittest.TestCase):
             self.assertTrue(hasattr(app, "btn_air_price"))
             self.assertFalse(app.btn_air_price.winfo_ismapped())
             self.assertEqual(
-                list(app.cat_buttons)[:5], ["装潢", "外包板", "线槽", "无线五方通话", "空调"]
+                list(app.cat_buttons)[:6], ["装潢", "外包板", "线槽", "无线五方通话", "井道照明", "空调"]
             )
             self.assertIn("外包板", app.cat_buttons)
             decoration_button = app.cat_buttons["装潢"]
@@ -314,6 +314,15 @@ class WorkbenchWindowTests(unittest.TestCase):
             ):
                 with self.subTest(widget=widget.cget("text")):
                     self.assertFalse(widget.winfo_ismapped())
+
+            # 井道照明隐藏的是整块无关流程；切回普通品类时必须完整恢复，
+            # 不能影响已验证稳定的网页查询、附件回填和 PM Matching 流程。
+            app._switch_category("空调")
+            root.update_idletasks()
+            root.update()
+            self.assertTrue(app.c2_outer.winfo_ismapped())
+            self.assertTrue(app.btn_web.winfo_ismapped())
+            self.assertTrue(app.btn_backfill.winfo_ismapped())
         finally:
             self._destroy_root(root)
 
@@ -342,6 +351,34 @@ class WorkbenchWindowTests(unittest.TestCase):
                 app.btn_retry_missing,
                 app.btn_backfill,
                 app.btn_tracking,
+            ):
+                with self.subTest(widget=widget.cget("text")):
+                    self.assertFalse(widget.winfo_ismapped())
+        finally:
+            self._destroy_root(root)
+
+    def test_shaft_lighting_shows_only_its_single_generation_step(self):
+        root = gui_module["create_workbench_root"]()
+        root.withdraw()
+        try:
+            app = gui_module["PivotTableApp"](root)
+            root.geometry("640x560+20+20")
+            app._switch_category("井道照明")
+            root.deiconify()
+            root.update_idletasks()
+            root.update()
+
+            self.assertEqual(app.btn.cget("text"), "① 生成井道照明数据与Saving")
+            self.assertTrue(app.btn.winfo_ismapped())
+            self.assertFalse(app.c2_outer.winfo_ismapped())
+            for widget in (
+                app.btn_factory,
+                app.btn_extra,
+                app.btn_web,
+                app.btn_retry_missing,
+                app.btn_backfill,
+                app.btn_tracking,
+                app.btn_air_price,
             ):
                 with self.subTest(widget=widget.cget("text")):
                     self.assertFalse(widget.winfo_ismapped())

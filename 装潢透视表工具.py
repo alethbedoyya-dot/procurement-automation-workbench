@@ -127,6 +127,20 @@ CATEGORIES = {
         "insert_cols_after_order": [],
         "insert_col_at_end": None,
     },
+    "井道照明": {
+        "label": "井道照明",
+        "filter_materials": [1000027319],
+        "data_sheet": "井道照明数据",
+        "target_sheet": "井道照明Saving",
+        "pivot_table_name": "井道照明Saving",
+        "workflow": "lighting_saving",
+        "required_source_columns": ["物料", "订单净值", "短文本"],
+        "pivot_row_fields": ["描述"],
+        "pivot_value_field": "PO数量",
+        "pivot_value_name": "求和项:PO数量",
+        "insert_cols_after_order": [],
+        "insert_col_at_end": None,
+    },
     "空调": {
         "label": "空调",
         "filter_materials": [1000027316],
@@ -269,8 +283,14 @@ def _com_try_open(excel, path):
         return None
 
 
-def _com_create_pivot(wb_com, total_cols, total_rows, source_name, target_sheet, pivot_table_name):
+def _com_create_pivot(
+    wb_com, total_cols, total_rows, source_name, target_sheet, pivot_table_name,
+    row_fields=None, value_field=None, value_name=None,
+):
     """在 COM 工作簿中创建/更新透视表"""
+    row_fields = row_fields or ROW_FIELDS
+    value_field = value_field or VALUE_FIELD
+    value_name = value_name or VALUE_NAME
     # 删除旧透视表 Sheet
     for s in list(wb_com.Sheets):
         if s.Name == target_sheet:
@@ -297,15 +317,87 @@ def _com_create_pivot(wb_com, total_cols, total_rows, source_name, target_sheet,
     )
 
     # 添加行字段（层级顺序）
-    for i, field_name in enumerate(ROW_FIELDS, start=1):
+    for i, field_name in enumerate(row_fields, start=1):
         pf = pivot_table.PivotFields(field_name)
         pf.Orientation = XlRowField
         pf.Position = i
 
     # 添加值字段（求和）
     pivot_table.AddDataField(
-        pivot_table.PivotFields(VALUE_FIELD), VALUE_NAME, XlSum
+        pivot_table.PivotFields(value_field), value_name, XlSum
     )
+    return new_ws, pivot_table
+
+
+def _lighting_pivot_count_expression(description):
+    """返回从井道照明透视表读取单个描述汇总数量的 Excel 表达式。"""
+    escaped_description = description.replace('"', '""')
+    return (
+        'IFERROR(GETPIVOTDATA("求和项:PO数量",$A$1,"描述",'
+        f'"{escaped_description}"),0)'
+    )
+
+
+def _apply_lighting_saving_layout(worksheet):
+    """在井道照明 Saving Sheet 右侧写入固定业务规则和可刷新的计算公式。"""
+    rules = (
+        (
+            "有机房 7米方案", 680.043, 565.562, 114.481,
+            "SAP PO 数量 (=Shaft Lighting 044 + 045)",
+            f"={_lighting_pivot_count_expression('Shaft Lighting 044')}+"
+            f"{_lighting_pivot_count_expression('Shaft Lighting 045')}",
+        ),
+        (
+            "有机房 3+2 方案", 529.018, 469.891, 59.127,
+            "SAP PO 数量 (=Shaft Lighting 061 - 070)",
+            f"={_lighting_pivot_count_expression('Shaft Lighting 061')}-"
+            f"{_lighting_pivot_count_expression('Shaft Lighting 070')}",
+        ),
+        (
+            "有机房 3+2 方案", 529.018, 511.481, 17.537,
+            "SAP PO 数量 (=Shaft Lighting 053- (044+045) - (061-070))",
+            f"={_lighting_pivot_count_expression('Shaft Lighting 053')}-N6-N7",
+        ),
+        (
+            "无机房 7米方案", 358.7745, 274.023, 84.7515,
+            "SAP PO 数量 (=Shaft Lighting 069)",
+            f"={_lighting_pivot_count_expression('Shaft Lighting 069')}",
+        ),
+        (
+            "无机房 3+2 方案", 325.238, 242.831, 82.407,
+            "SAP PO 数量 (=Shaft Lighting 070)",
+            f"={_lighting_pivot_count_expression('Shaft Lighting 070')}",
+        ),
+        (
+            "无机房 3+2 方案", 325.238, 320.241, 4.997,
+            "SAP PO 数量 (=Shaft Lighting071-069-070)",
+            f"={_lighting_pivot_count_expression('Shaft Lighting 071')}-N9-N10",
+        ),
+    )
+    headers = (
+        "2024 年 11 月 1 号版本价格", "2025 年 10 月 30 号版本价格",
+        "Saving (单台)", "台量统计方法", "实际梯台数", "Saving 总额",
+    )
+
+    worksheet.Range("I5:J5").Merge()
+    worksheet.Range("I5").Value = headers[0]
+    for column, header in zip(("K", "L", "M", "N", "O"), headers[1:]):
+        worksheet.Range(f"{column}5").Value = header
+
+    for row_number, rule in enumerate(rules, start=6):
+        scheme, old_price, new_price, unit_saving, count_method, count_formula = rule
+        worksheet.Range(f"I{row_number}").Value = scheme
+        worksheet.Range(f"J{row_number}").Value = old_price
+        worksheet.Range(f"K{row_number}").Value = new_price
+        worksheet.Range(f"L{row_number}").Value = unit_saving
+        worksheet.Range(f"M{row_number}").Value = count_method
+        worksheet.Range(f"N{row_number}").Formula = count_formula
+        worksheet.Range(f"O{row_number}").Formula = f"=N{row_number}*L{row_number}"
+
+    worksheet.Range("O12").Formula = "=SUM(O6:O11)"
+    worksheet.Range("J6:L11").NumberFormat = "0.000"
+    worksheet.Range("N6:N11").NumberFormat = "0.000"
+    worksheet.Range("O6:O12").NumberFormat = "0.000"
 
 
 # ═══════════════════ 数据增强 ═══════════════════
@@ -534,6 +626,16 @@ def _enhance_and_filter(cfg, _log):
     if len(df_filtered) == 0:
         raise RuntimeError(f"[{label}] 筛选后无数据！物料 {filter_materials} 在数据中不存在。")
     _log(f"[{label}] 筛选后数据行数: {len(df_filtered)}")
+
+    # 井道照明只在独立数据 Sheet 中增加描述和计数辅助列，不能污染 Sheet1。
+    if cfg.get("workflow") == "lighting_saving":
+        if "短文本" not in df_filtered.columns:
+            raise RuntimeError(f"[{label}] 筛选数据缺少必需列：短文本")
+        source_text = df_filtered["短文本"].where(
+            df_filtered["短文本"].notna(), ""
+        ).astype(str)
+        df_filtered["描述"] = source_text.str.slice(2).str.strip()
+        df_filtered["PO数量"] = 1
 
     # 轻量价格类只需要在品类数据 Sheet 中追加计算列，不能污染 Sheet1，
     # 也不会为后续透视表或其他品类预先插入无关列。
@@ -1764,9 +1866,13 @@ def generate_pivot_table(category=None, status_callback=None):
     filter_materials = cfg["filter_materials"]
     data_sheet = cfg["data_sheet"]
     is_data_price_workflow = cfg.get("workflow") == "data_price"
+    is_lighting_saving_workflow = cfg.get("workflow") == "lighting_saving"
     target_sheet = cfg.get("target_sheet")
     pivot_table_name = cfg.get("pivot_table_name")
     required_source_columns = cfg.get("required_source_columns", CHECK_COLS)
+    pivot_row_fields = cfg.get("pivot_row_fields", ROW_FIELDS)
+    pivot_value_field = cfg.get("pivot_value_field", VALUE_FIELD)
+    pivot_value_name = cfg.get("pivot_value_name", VALUE_NAME)
 
     # ── 1. 检查文件 ──
     if not os.path.exists(EXCEL_FILE):
@@ -1819,10 +1925,17 @@ def generate_pivot_table(category=None, status_callback=None):
         if wb is None:
             return False, "COM 无法打开文件，请关闭其他正在使用该文件的程序后重试。"
 
-        _com_create_pivot(wb, total_cols, total_rows,
-                          source_name=data_sheet,
-                          target_sheet=target_sheet,
-                          pivot_table_name=pivot_table_name)
+        created_sheet, _ = _com_create_pivot(
+            wb, total_cols, total_rows,
+            source_name=data_sheet,
+            target_sheet=target_sheet,
+            pivot_table_name=pivot_table_name,
+            row_fields=pivot_row_fields,
+            value_field=pivot_value_field,
+            value_name=pivot_value_name,
+        )
+        if is_lighting_saving_workflow:
+            _apply_lighting_saving_layout(created_sheet)
 
         _log("正在保存...")
         wb.Save()
@@ -1834,16 +1947,19 @@ def generate_pivot_table(category=None, status_callback=None):
     finally:
         _com_stop(excel, wb)
 
-    return True, (
+    summary = (
         f"[{label}] 原生透视表生成成功！\n\n"
         f"筛选物料：{filter_materials}\n"
         f"筛选后数据行数：{total_rows}\n"
-        f"行层级：{' → '.join(ROW_FIELDS)}\n"
-        f"值字段：{VALUE_NAME}（求和）\n"
+        f"行层级：{' → '.join(pivot_row_fields)}\n"
+        f"值字段：{pivot_value_name}（求和）\n"
         f"目标 Sheet：\"{target_sheet}\"（紧邻 Sheet1 右侧）\n\n"
-        f"Sheet1 原有格式完整保留，仅新增了品类相关列。\n\n"
-        f"════════════ 诊断信息 ════════════\n{match_debug}"
+        f"Sheet1 原有格式完整保留，仅新增了品类相关列。\n"
     )
+    if is_lighting_saving_workflow:
+        summary += "右侧已写入井道照明固定规则、实际梯台数与 Saving 总额公式。\n"
+    summary += f"\n════════════ 诊断信息 ════════════\n{match_debug}"
+    return True, summary
 
 
 # ═══════════════════ GUI 界面 ═══════════════════
@@ -1950,7 +2066,8 @@ class PivotTableApp:
         self._update_hint_labels()
         self._apply_category_workflow_ui()
         self._update_workflow_guidance()
-        steps = "① → ②" if CATEGORIES[category].get("workflow") == "data_price" else "① → ② → ③ → ④ → ⑤"
+        workflow = CATEGORIES[category].get("workflow")
+        steps = "①" if workflow == "lighting_saving" else "① → ②" if workflow == "data_price" else "① → ② → ③ → ④ → ⑤"
         self._update_status(
             f"已切换到「{CATEGORIES[category]['label']}」模式 — 按 {steps} 依次完成",
             "#3b82f6"
@@ -1965,6 +2082,9 @@ class PivotTableApp:
     def _update_button_labels(self):
         cfg = CATEGORIES[self.active_category]
         label = cfg["label"]
+        if cfg.get("workflow") == "lighting_saving":
+            self.btn.config(text=f"① 生成{label}数据与Saving")
+            return
         if cfg.get("workflow") == "data_price":
             self.btn.config(text=f"① 生成{label}数据")
             self.btn_air_price.config(text=f"② 填充{label}价格并计算 Saving")
@@ -1982,6 +2102,11 @@ class PivotTableApp:
         cfg = CATEGORIES[self.active_category]
         label = cfg["label"]
         materials = cfg["filter_materials"]
+        if cfg.get("workflow") == "lighting_saving":
+            self.hint1.config(
+                text=f"筛选物料 {materials} → 新增描述 / PO数量 → 生成「{cfg['target_sheet']}」原生透视表与 Saving 计算"
+            )
+            return
         if cfg.get("workflow") == "data_price":
             self.hint1.config(
                 text=f"筛选物料 {materials} → 生成「{cfg['data_sheet']}」；本品类不创建透视表"
@@ -2008,6 +2133,7 @@ class PivotTableApp:
         """按品类工作流显示对应按钮，线槽不暴露无关的网页/透视表操作。"""
         cfg = CATEGORIES[self.active_category]
         is_data_price = cfg.get("workflow") == "data_price"
+        is_lighting_saving = cfg.get("workflow") == "lighting_saving"
 
         # 每次先收起再按固定顺序重新布局，避免来回切换后控件顺序错乱。
         for widget in (
@@ -2021,6 +2147,20 @@ class PivotTableApp:
         ):
             widget.pack_forget()
 
+        if is_lighting_saving:
+            self.workflow_outer.pack_forget()
+            self.c2_outer.pack_forget()
+            self.c1_title.config(text=f"01  生成{cfg['label']}数据与Saving")
+            self.btn.pack(fill=tk.X, padx=20, pady=(4, 0))
+            self.hint1.pack(anchor=tk.W, padx=22, pady=(2, 0))
+            self.c1_bottom_spacer.pack()
+            return
+
+        if not self.c2_outer.winfo_manager():
+            self.c2_outer.pack(
+                fill=tk.X, padx=24, pady=(12, 0), before=self.log_frame,
+            )
+
         if is_data_price:
             self.workflow_outer.pack_forget()
             self.c1_title.config(text=f"01  生成{cfg['label']}数据")
@@ -2033,9 +2173,10 @@ class PivotTableApp:
             self.c2_bottom_spacer.pack()
             return
 
-        self.workflow_outer.pack(
-            fill=tk.X, padx=24, pady=(18, 0), before=self.c1_outer,
-        )
+        if not self.workflow_outer.winfo_manager():
+            self.workflow_outer.pack(
+                fill=tk.X, padx=24, pady=(18, 0), before=self.c1_outer,
+            )
         self.c1_title.config(text="01  数据准备")
         self.btn_factory.pack(fill=tk.X, padx=20, pady=(4, 0))
         self.hint_factory.pack(anchor=tk.W, padx=22, pady=(2, 0))
@@ -2068,7 +2209,10 @@ class PivotTableApp:
         CARD_BORDER = "#d9e2ec"
 
         # ── 顶部标题栏 ──
-        header = tk.Frame(self.root, bg="#102a43", height=180)
+        category_buttons_per_row = 4
+        category_rows = (len(CATEGORIES) + category_buttons_per_row - 1) // category_buttons_per_row
+        header_height = 180 + max(0, category_rows - 2) * 34
+        header = tk.Frame(self.root, bg="#102a43", height=header_height)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
         # 标题与品类切换占上行，窗口控制固定在下行。这样窗口变窄时不会让
@@ -2085,7 +2229,6 @@ class PivotTableApp:
         cat_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=(0, 6))
         self.cat_buttons = {}
         categories_order = list(CATEGORIES.keys())
-        category_buttons_per_row = 4
         for column in range(category_buttons_per_row):
             cat_frame.grid_columnconfigure(column, weight=1)
         for i, cat_key in enumerate(categories_order):
@@ -2288,6 +2431,7 @@ class PivotTableApp:
 
         # ══════════ 卡片 2：网站查询与匹配 ══════════
         c2_outer, c2 = _card(content, "02  查询下载与回填核对")
+        self.c2_outer = c2_outer
         self.c2_title = c2._card_title_label
         c2_outer.pack(fill=tk.X, padx=24, pady=(12, 0))
 
@@ -2340,10 +2484,8 @@ class PivotTableApp:
             "FLD PO 用透视表覆盖；无 FLD Saving =（老价格 - 净价）× 采购订单数量；CHECK = 新价格 - 净价",
         )
 
-        # 初次启动同样走统一布局，确保装潢默认视图和后续品类切换一致。
-        self._apply_category_workflow_ui()
-
         log_frame = tk.Frame(content, bg="#102a43")
+        self.log_frame = log_frame
         log_frame.pack(fill=tk.BOTH, expand=True, padx=24, pady=(12, 0))
         log_label = tk.Label(
             log_frame, text="运行日志", font=("Microsoft YaHei", 9, "bold"),
@@ -2359,6 +2501,9 @@ class PivotTableApp:
         self.log_text.configure(yscrollcommand=log_scroll.set)
         log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0, 5))
+
+        # 初次启动同样走统一布局，确保装潢默认视图和后续品类切换一致。
+        self._apply_category_workflow_ui()
 
         # ── 底部状态栏 ──
         # 不固定高度：高 DPI 或中文字体行高变化时，状态文字仍须完整可见。
@@ -2772,7 +2917,12 @@ class PivotTableApp:
     def _done(self, success, msg):
         cfg = CATEGORIES[self.active_category]
         label = cfg["label"]
-        button_text = f"① 生成{label}数据" if cfg.get("workflow") == "data_price" else f"① 生成{label}透视表"
+        if cfg.get("workflow") == "lighting_saving":
+            button_text = f"① 生成{label}数据与Saving"
+        elif cfg.get("workflow") == "data_price":
+            button_text = f"① 生成{label}数据"
+        else:
+            button_text = f"① 生成{label}透视表"
         self.btn.config(state=tk.NORMAL, text=button_text)
         if success:
             self._update_status(f"[{label}] 生成成功！", "#27ae60")
