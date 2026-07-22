@@ -1,9 +1,12 @@
 import runpy
 import threading
 import tkinter as tk
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import openpyxl
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 GUI_SCRIPT = next(
@@ -61,26 +64,103 @@ class WorkbenchWindowTests(unittest.TestCase):
         finally:
             self._destroy_root(root)
 
-    def test_workbench_has_normal_window_controls_and_a_close_button(self):
+    def test_workbench_uses_system_close_control_and_hides_stop_until_query(self):
         root = gui_module["create_workbench_root"]()
         root.withdraw()
         try:
             app = gui_module["PivotTableApp"](root)
+            root.deiconify()
             root.update_idletasks()
 
             self.assertNotEqual(root.overrideredirect(), 1)
             self.assertEqual(root.resizable(), (1, 1))
             self.assertFalse(hasattr(app, "_recenter_window"))
-            self.assertTrue(hasattr(app, "btn_close"))
-            self.assertEqual(app.btn_close.cget("text"), "关闭工作台")
+            self.assertFalse(hasattr(app, "btn_close"))
             self.assertTrue(hasattr(app, "btn_stop_web"))
-            self.assertEqual(str(app.btn_stop_web.cget("state")), tk.DISABLED)
+            self.assertFalse(app.btn_stop_web.winfo_ismapped())
             self.assertEqual(app.btn_stop_web.cget("text"), "⏹ 停止查询")
             self.assertTrue(hasattr(app, "btn_retry_missing"))
             self.assertEqual(app.btn_retry_missing.cget("text"), "↻ 补查缺失 PO")
             self.assertEqual(str(app.btn_retry_missing.cget("state")), tk.NORMAL)
             self.assertEqual(app.btn_retry_missing.master, app.btn_web.master)
             self.assertTrue(hasattr(app, "content_canvas"))
+        finally:
+            self._destroy_root(root)
+
+    def test_purchase_record_is_selected_once_and_shared_with_web_query(self):
+        root = gui_module["create_workbench_root"]()
+        root.withdraw()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            record_path = Path(temp_dir) / "采购记录0801.xlsx"
+            workbook = openpyxl.Workbook()
+            workbook.active.title = "Sheet1"
+            workbook.save(record_path)
+            workbook.close()
+
+            import web_query
+            previous_web_file = web_query.EXCEL_FILE
+            try:
+                app = gui_module["PivotTableApp"](root)
+                gui_globals = app._ensure_purchase_record_selected.__globals__
+                previous_gui_file = gui_globals["EXCEL_FILE"]
+                with patch.object(
+                    gui_module["filedialog"], "askopenfilename", return_value=str(record_path)
+                ) as chooser:
+                    self.assertTrue(app._ensure_purchase_record_selected())
+                    self.assertTrue(app._ensure_purchase_record_selected())
+
+                self.assertEqual(chooser.call_count, 1)
+                self.assertEqual(gui_globals["EXCEL_FILE"], str(record_path))
+                self.assertEqual(web_query.EXCEL_FILE, str(record_path))
+                self.assertIn(record_path.name, app.lbl_current_record.cget("text"))
+            finally:
+                gui_globals["EXCEL_FILE"] = previous_gui_file
+                web_query.EXCEL_FILE = previous_web_file
+                self._destroy_root(root)
+
+    def test_excel_actions_start_on_background_threads(self):
+        """区域匹配、生成透视表和扩展列都不能阻塞 Tk 主线程。"""
+        root = gui_module["create_workbench_root"]()
+        root.withdraw()
+        try:
+            app = gui_module["PivotTableApp"](root)
+            created_threads = []
+
+            class FakeThread:
+                def __init__(self, target, daemon):
+                    self.target = target
+                    self.daemon = daemon
+                    self.started = False
+                    created_threads.append(self)
+
+                def start(self):
+                    self.started = True
+
+            with patch.object(gui_module["threading"], "Thread", FakeThread), patch.object(
+                app, "_ensure_purchase_record_selected", return_value=True
+            ):
+                app._on_factory_click()
+                app._on_click()
+                app._on_extra_click()
+
+            self.assertEqual(len(created_threads), 3)
+            self.assertTrue(all(thread.daemon and thread.started for thread in created_threads))
+        finally:
+            self._destroy_root(root)
+
+    def test_background_status_updates_are_batched_before_touching_the_ui(self):
+        """网页日志再多也只能批量刷新，不能给 Tk 事件队列塞入大量 after 回调。"""
+        root = gui_module["create_workbench_root"]()
+        root.withdraw()
+        try:
+            app = gui_module["PivotTableApp"](root)
+            for index in range(250):
+                app._queue_status_update(f"后台日志 {index}", "#3b82f6")
+
+            app._drain_queued_status_updates()
+
+            self.assertEqual(app.lbl_status.cget("text"), "后台日志 249")
+            self.assertIn("后台日志 249", app.log_text.get("1.0", tk.END))
         finally:
             self._destroy_root(root)
 
@@ -139,7 +219,7 @@ class WorkbenchWindowTests(unittest.TestCase):
         finally:
             self._destroy_root(root)
 
-    def test_stop_control_remains_visible_and_legible_at_minimum_width(self):
+    def test_stop_control_appears_next_to_query_only_while_a_query_is_running(self):
         root = gui_module["create_workbench_root"]()
         root.withdraw()
         try:
@@ -149,13 +229,20 @@ class WorkbenchWindowTests(unittest.TestCase):
             root.update_idletasks()
             root.update()
 
+            self.assertFalse(app.btn_stop_web.winfo_ismapped())
+            app._set_stop_query_visible(True)
+            root.update_idletasks()
+
             left = app.btn_stop_web.winfo_rootx() - root.winfo_rootx()
             right = left + app.btn_stop_web.winfo_width()
             self.assertTrue(app.btn_stop_web.winfo_ismapped())
             self.assertGreaterEqual(left, 0)
             self.assertLessEqual(right, root.winfo_width())
-            self.assertEqual(app.btn_stop_web.winfo_class(), "TButton")
-            self.assertEqual(str(app.btn_stop_web.cget("state")), tk.DISABLED)
+            self.assertEqual(app.btn_stop_web.master, app.btn_web.master)
+            self.assertEqual(str(app.btn_stop_web.cget("state")), tk.NORMAL)
+
+            app._set_stop_query_visible(False)
+            self.assertFalse(app.btn_stop_web.winfo_ismapped())
         finally:
             self._destroy_root(root)
 

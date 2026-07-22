@@ -90,6 +90,43 @@ class ICCardAutomationTests(unittest.TestCase):
         self.assertIsNone(cfg["insert_col_at_end"])
         self.assertNotIn("price_list_sheet", cfg)
 
+    def test_category_data_sheets_keep_only_the_price_columns_they_need(self):
+        workbook = openpyxl.Workbook()
+        source_sheet = workbook.active
+        source_sheet.title = "Sheet1"
+        source_sheet.append([
+            "物料", "订单净值", "短文本", "净价", "采购订单数量",
+            "老价格", "新价格", "Saving", "CHECK",
+        ])
+        source_sheet.append([1000027307, 100, "装潢", 80, 1, 120, 110, 10, 0])
+        source_sheet.append([1000027309, 100, "外包板", 80, 1, 120, 110, 10, 0])
+        source_sheet.append([1000027323, 100, "线槽", 80, 1, 120, 110, 10, 0])
+        source_sheet.append([8001366263, 100, "五方", 80, 1, 120, 110, 10, 0])
+        source_sheet.append([1000027319, 100, "GL Shaft Lighting 044", 80, 1, 120, 110, 10, 0])
+        workbook.save(self.excel_path)
+        workbook.close()
+
+        expected_headers = {
+            "装潢": ["物料", "订单净值", "短文本", "净价", "采购订单数量"],
+            "外包板": ["物料", "订单净值", "短文本", "净价", "采购订单数量"],
+            "线槽": ["物料", "订单净值", "短文本", "净价", "采购订单数量", "老价格", "新价格", "Saving"],
+            "无线五方通话": ["物料", "订单净值", "短文本", "净价", "采购订单数量", "老价格", "新价格", "Saving"],
+            "井道照明": ["物料", "订单净值", "短文本", "净价", "采购订单数量", "描述", "PO数量"],
+        }
+
+        for category, expected in expected_headers.items():
+            self.module["_enhance_and_filter"](
+                self.module["CATEGORIES"][category], lambda _msg: None
+            )
+            workbook = openpyxl.load_workbook(self.excel_path, data_only=True)
+            data_sheet = workbook[self.module["CATEGORIES"][category]["data_sheet"]]
+            actual = [
+                data_sheet.cell(1, column).value
+                for column in range(1, data_sheet.max_column + 1)
+            ]
+            workbook.close()
+            self.assertEqual(actual, expected, category)
+
     def test_outsource_board_pm_tracking_uses_outsource_content(self):
         workbook = openpyxl.Workbook()
         worksheet = workbook.active
@@ -216,10 +253,11 @@ class ICCardAutomationTests(unittest.TestCase):
         price_book = openpyxl.Workbook()
         price_sheet = price_book.active
         price_sheet.title = "五方2026.05降价"
-        price_sheet.append([None] * 10)
-        price_sheet.append([None, None, None, None, "五方物料A", None, None, 100, None, 80])
-        price_sheet.append([None, None, None, None, "五方物料B", None, None, 120, None, 90])
-        price_sheet.append([None, None, None, None, "五方物料零", None, None, 0, None, 0])
+        price_sheet.append([None, "PN(Material)", None, None, "SAP Discription-Ner", None, None, "OLD Price", None, "NEW Price"])
+        # 五方通话必须按物料号匹配；短文本故意不相同，以防回退到文本匹配。
+        price_sheet.append([None, 8001366263, None, None, "SHOULD-NOT-MATCH-A", None, None, 100, None, 80])
+        price_sheet.append([None, 8001366265, None, None, "SHOULD-NOT-MATCH-B", None, None, 120, None, 90])
+        price_sheet.append([None, 8001366267, None, None, "SHOULD-NOT-MATCH-ZERO", None, None, 0, None, 0])
         price_book.save(self.price_path)
         price_book.close()
 

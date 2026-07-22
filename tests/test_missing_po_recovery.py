@@ -97,6 +97,31 @@ class MissingPoRecoveryTests(unittest.TestCase):
         self.assertIn("先点击「③ 打开网站查询」", message)
         query.assert_not_called()
 
+    def test_retry_requeries_a_completed_po_when_its_wbs_is_blank(self):
+        """目录齐全但 WBS 漏写时，补查应只重新查询该 PO。"""
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            web_query, "DOWNLOAD_DIR", temp_dir
+        ), patch.object(
+            web_query, "extract_all_pos_from_pivot",
+            return_value=["4000000001", "4000000002"],
+        ), patch.object(
+            web_query, "_find_pos_with_missing_wbs", create=True,
+            return_value=["4000000002"],
+        ), patch.object(
+            web_query, "query_and_download_attachments",
+            return_value=(True, "补全完成"),
+        ) as query:
+            self._make_po_folder(temp_dir, "空调", "FLD文件", "4000000001")
+            self._make_po_folder(temp_dir, "空调", "无FLD文件", "4000000002")
+
+            success, message = web_query.retry_missing_pos(
+                target_sheet="空调透视表", category_label="空调"
+            )
+
+        self.assertTrue(success)
+        self.assertIn("WBS", message)
+        self.assertEqual(query.call_args.kwargs["po_numbers"], ["4000000002"])
+
     def test_merges_recovery_result_by_replacing_the_old_result_for_the_same_po(self):
         merged = web_query.merge_query_results(
             [

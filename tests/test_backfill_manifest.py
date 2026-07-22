@@ -21,6 +21,26 @@ class PendingBackfillManifestTests(unittest.TestCase):
         self.assertEqual(wbs, "FSSO-71380")
         self.assertTrue(any("WBS" in message for message in messages))
 
+    def test_retries_wbs_read_when_the_detail_page_header_is_late(self):
+        class DelayedDetailPage:
+            def __init__(self):
+                self.calls = 0
+
+            def inner_text(self, selector):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("detail header is still loading")
+                return "项目WBS No  FSSO-8554"
+
+        page = DelayedDetailPage()
+        messages = []
+        with patch.object(web_query.time, "sleep"):
+            wbs = web_query._extract_wbs(page, messages.append)
+
+        self.assertEqual(wbs, "FSSO-8554")
+        self.assertEqual(page.calls, 2)
+        self.assertTrue(any("重试" in message for message in messages))
+
     def test_saves_and_loads_a_manifest_for_its_own_category(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.object(web_query, "DOWNLOAD_DIR", temp_dir), patch.object(

@@ -51,6 +51,13 @@ OCR_TIMEOUT = 60
 TARGET_MSG_PREFIXES = ("fld",)
 APPROVAL_PRICE_LABEL = "\u5ba1\u6279\u4ef7\u683c"
 
+
+def set_purchase_record_file(excel_path):
+    """由工作台同步本次会话已选择的采购记录文件。"""
+    global EXCEL_FILE
+    EXCEL_FILE = os.path.abspath(excel_path)
+    return EXCEL_FILE
+
 # 详情页会被复用为下一轮的搜索页。焦点模拟属于 CDP 会话级状态，
 # 因此会话必须一直保留到该页面真正关闭时才释放。弱引用避免已关闭页面
 # 因全局缓存而常驻内存；锁避免 GUI 工作线程出现并发访问时相互覆盖。
@@ -157,6 +164,66 @@ def audit_download_completeness(expected_pos, category_label=None, failed_pos=No
     }
 
 
+def _find_pos_with_missing_wbs(excel_path, target_sheet, expected_pos):
+    """找出已下载但透视表 WBS 仍为空的 PO，供补查按钮单独补全。"""
+    import gc
+    import openpyxl
+
+    expected = _normalise_po_list(expected_pos)
+    if not expected or not os.path.exists(excel_path):
+        return []
+
+    workbook = None
+    try:
+        workbook = openpyxl.load_workbook(
+            excel_path, data_only=True, read_only=True
+        )
+        if target_sheet not in workbook.sheetnames:
+            return []
+        worksheet = workbook[target_sheet]
+
+        header_rows = worksheet.iter_rows(min_row=1, max_row=1, values_only=True)
+        try:
+            headers = next(header_rows, ())
+        finally:
+            header_rows.close()
+        wbs_column = next(
+            (
+                index
+                for index, value in enumerate(headers, start=1)
+                if str(value or "").strip() == "WBS"
+            ),
+            None,
+        )
+        if wbs_column is None:
+            return []
+
+        expected_set = set(expected)
+        missing = set()
+        rows = worksheet.iter_rows(
+            min_row=2, min_col=1, max_col=max(1, wbs_column), values_only=True
+        )
+        try:
+            for values in rows:
+                po = str(values[0] or "").strip()
+                if po not in expected_set:
+                    continue
+                wbs = str(values[wbs_column - 1] or "").strip()
+                if not wbs:
+                    missing.add(po)
+        finally:
+            rows.close()
+        return [po for po in expected if po in missing]
+    except Exception:
+        # WBS 补全是“补查”附加能力；读取失败不能影响已有的附件缺失补查。
+        return []
+    finally:
+        if workbook is not None:
+            workbook.close()
+            del workbook
+            gc.collect()
+
+
 def merge_query_results(existing_results, new_results, expected_pos, replaced_pos=None):
     """将补查结果按 PO 覆盖并回原任务，避免重复回填同一 PO。"""
     allowed_pos = set(_normalise_po_list(expected_pos))
@@ -205,14 +272,24 @@ def retry_missing_pos(
         category,
         failed_pos=(manifest or {}).get("failed_pos", []),
     )
-    missing_pos = audit["missing_pos"]
+    missing_download_pos = audit["missing_pos"]
+    missing_wbs_pos = _find_pos_with_missing_wbs(EXCEL_FILE, ts, expected_pos)
+    missing_pos = _normalise_po_list(missing_download_pos + missing_wbs_pos)
     if not manifest and not audit["folder_pos"]:
         return False, "未发现历史查询记录，请先点击「③ 打开网站查询」。"
     if not missing_pos:
-        return True, f"完整性检查通过：{len(expected_pos)} 个 PO 均已有下载目录，无需补查。"
+        return True, (
+            f"完整性检查通过：{len(expected_pos)} 个 PO 均已有下载目录，"
+            "且 WBS 已完整，无需补查。"
+        )
 
     if status_callback:
-        status_callback("待补查 PO：" + "、".join(missing_pos))
+        reason = []
+        if missing_download_pos:
+            reason.append("附件缺失：" + "、".join(missing_download_pos))
+        if missing_wbs_pos:
+            reason.append("WBS待补全：" + "、".join(missing_wbs_pos))
+        status_callback("；".join(reason))
     success, message = query_and_download_attachments(
         target_sheet=ts,
         category_label=category,
@@ -222,7 +299,10 @@ def retry_missing_pos(
         resume_manifest=manifest,
         is_recovery_run=True,
     )
-    return success, "补查 PO：" + "、".join(missing_pos) + "\n\n" + message
+    summary = "补查 PO：" + "、".join(missing_pos)
+    if missing_wbs_pos:
+        summary += "\nWBS 补全 PO：" + "、".join(missing_wbs_pos)
+    return success, summary + "\n\n" + message
 
 
 def _save_pending_backfill_manifest(manifest):
@@ -307,6 +387,42 @@ def _archive_pending_backfill_manifest(category_label):
 
 # ═══════════════════ PO 号提取 ═══════════════════
 
+def _extract_pos_from_purchase_order_column(worksheet):
+    """从已知的「采购凭证」列读取并去重 PO，适配 read_only 工作表。"""
+    header_rows = worksheet.iter_rows(min_row=1, max_row=1, values_only=True)
+    try:
+        header_row = next(header_rows, ())
+    finally:
+        # 只读模式下生成器会持有 xlsx 压缩包句柄；必须显式关闭，
+        # 否则 Windows 可能暂时无法释放正在读取的工作簿。
+        header_rows.close()
+    po_column = next(
+        (
+            index
+            for index, header in enumerate(header_row, start=1)
+            if "采购凭证" in str(header or "").strip()
+        ),
+        None,
+    )
+    if po_column is None:
+        return []
+
+    pos = []
+    seen = set()
+    data_rows = worksheet.iter_rows(
+        min_row=2, min_col=po_column, max_col=po_column, values_only=True
+    )
+    try:
+        for (value,) in data_rows:
+            po = str(value or "").strip()
+            if po and re.fullmatch(r"\d{7,12}", po) and po not in seen:
+                seen.add(po)
+                pos.append(po)
+    finally:
+        data_rows.close()
+    return pos
+
+
 def extract_all_pos_from_pivot(excel_path=None, sheet_name=None):
     """
     从透视表 Sheet 中提取所有有效的采购凭证号（去重）。
@@ -320,48 +436,50 @@ def extract_all_pos_from_pivot(excel_path=None, sheet_name=None):
     if not os.path.exists(path):
         return []
 
-    wb = openpyxl.load_workbook(path, data_only=True)
+    # read_only 不加载整本工作簿的样式、公式及透视表对象；对大文件能明显缩短
+    # 按钮③开始前的等待时间，也避免占用过多内存。
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    try:
+        # 新版本的每个品类都先生成独立「XX数据」Sheet。它已按物料筛选，且
+        # 只有真实采购凭证列，直接读取比扫描整张透视表更快、更可靠。
+        data_sheet_name = name.replace("透视表", "数据")
+        if data_sheet_name != name and data_sheet_name in wb.sheetnames:
+            data_pos = _extract_pos_from_purchase_order_column(wb[data_sheet_name])
+            if data_pos:
+                return data_pos
 
-    # ── 步骤1: 从 Sheet1 读取合法 PO 白名单 ──
-    valid_pos = set()
-    if "Sheet1" in wb.sheetnames:
-        ws1 = wb["Sheet1"]
-        po_col = None
-        for col_idx in range(1, ws1.max_column + 1):
-            header = str(ws1.cell(1, col_idx).value or "").strip()
-            if "采购凭证" in header:
-                po_col = col_idx
-                break
-        if po_col:
-            for row_idx in range(2, ws1.max_row + 1):
-                val = str(ws1.cell(row_idx, po_col).value or "").strip()
-                if val and re.match(r'^\d{7,12}$', val):
-                    valid_pos.add(val)
+        # 兼容旧版本：没有「XX数据」Sheet 时，沿用 Sheet1 白名单 + 透视表扫描。
+        valid_pos = set()
+        if "Sheet1" in wb.sheetnames:
+            valid_pos = set(_extract_pos_from_purchase_order_column(wb["Sheet1"]))
 
-    # ── 步骤2: 从透视表提取数字，只保留白名单中的 ──
-    if name not in wb.sheetnames:
-        wb.close()
-        return []
+        if name not in wb.sheetnames:
+            return []
 
-    ws = wb[name]
-    seen = set()
-    pos = []
-    skipped = 0
-
-    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=ws.max_column):
-        for cell in row:
-            val = str(cell.value or "").strip()
-            if val and re.match(r'^\d{7,12}$', val) and val not in seen:
-                seen.add(val)
-                if valid_pos and val not in valid_pos:
+        seen = set()
+        pos = []
+        skipped = 0
+        for row in wb[name].iter_rows(values_only=True):
+            for value in row:
+                po = str(value or "").strip()
+                if not po or not re.fullmatch(r"\d{7,12}", po) or po in seen:
+                    continue
+                seen.add(po)
+                if valid_pos and po not in valid_pos:
                     skipped += 1
                     continue
-                pos.append(val)
+                pos.append(po)
 
-    wb.close()
-    if skipped:
-        print(f"[PO提取] 已过滤 {skipped} 个非 PO 数字（如金额/数量等）")
-    return pos
+        if skipped:
+            print(f"[PO提取] 已过滤 {skipped} 个非 PO 数字（如金额/数量等）")
+        return pos
+    finally:
+        wb.close()
+        # 某些 openpyxl 版本在 Windows 的只读模式会让工作表迭代器形成延迟回收
+        # 的引用环。主动回收可确保 Excel 文件马上可再次被 Excel/自动化打开。
+        del wb
+        import gc
+        gc.collect()
 
 
 # ═══════════════════ 辅助函数 ═══════════════════
@@ -778,15 +896,8 @@ def _extract_project_name(page, log):
     return None
 
 
-def _extract_wbs(page, log):
-    """从详情页头部提取「项目WBS No」字段值。"""
-    try:
-        body_text = page.inner_text("body")
-    except Exception:
-        return None
-    if not body_text:
-        return None
-
+def _extract_wbs_from_text(body_text):
+    """从详情页已获取的文本中解析 WBS，供首次读取和延迟重试共用。"""
     pattern = re.compile(
         r"项目\s*WBS\s*(?:No\.?)?\s*[：:]?\s*([A-Za-z0-9][A-Za-z0-9._/-]*)",
         re.IGNORECASE,
@@ -796,9 +907,7 @@ def _extract_wbs(page, log):
             continue
         match = pattern.search(line)
         if match:
-            wbs = match.group(1).strip()
-            log(f"  项目WBS No: {wbs}")
-            return wbs
+            return match.group(1).strip()
 
     # 少数页面会把标签和值渲染为相邻两行。
     lines = [line.strip() for line in body_text.split("\n") if line.strip()]
@@ -807,8 +916,34 @@ def _extract_wbs(page, log):
             continue
         candidate = lines[index + 1]
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", candidate):
-            log(f"  项目WBS No（下行）: {candidate}")
             return candidate
+
+    return None
+
+
+def _extract_wbs(page, log):
+    """从详情页头部提取「项目WBS No」字段值，并容忍页面头部延迟加载。"""
+    for attempt in range(1, 4):
+        try:
+            try:
+                body_text = page.inner_text("body", timeout=5000)
+            except TypeError:
+                # 测试替身及旧版 Playwright 可能没有 timeout 具名参数。
+                body_text = page.inner_text("body")
+        except Exception as exc:
+            body_text = None
+            log(f"  ⚠ 读取项目WBS No失败（第 {attempt}/3 次）：{exc}")
+
+        if body_text:
+            wbs = _extract_wbs_from_text(body_text)
+            if wbs:
+                suffix = "" if attempt == 1 else f"（第 {attempt} 次读取）"
+                log(f"  项目WBS No{suffix}: {wbs}")
+                return wbs
+
+        if attempt < 3:
+            log(f"  ⓘ 项目WBS No尚未就绪，1 秒后重试（第 {attempt}/3 次）")
+            time.sleep(1)
 
     log("  ⚠ 未提取到项目WBS No")
     return None
@@ -1850,10 +1985,16 @@ class _PivotExcelBackfillWriter:
             return
 
         worksheet = self._order_value_workbook[self.sheet]
-        for row in range(2, worksheet.max_row + 1):
-            po_str = str(worksheet.cell(row, 1).value or "").strip()
-            if po_str and po_str not in self._order_values:
-                self._order_values[po_str] = worksheet.cell(row, 2).value
+        rows = worksheet.iter_rows(
+            min_row=2, min_col=1, max_col=2, values_only=True
+        )
+        try:
+            for po_value, order_value in rows:
+                po_str = str(po_value or "").strip()
+                if po_str and po_str not in self._order_values:
+                    self._order_values[po_str] = order_value
+        finally:
+            rows.close()
 
     def get_order_value(self, po):
         try:
@@ -1941,6 +2082,7 @@ class _PivotExcelBackfillWriter:
                 self._order_value_workbook.close()
             except Exception:
                 pass
+            self._order_value_workbook = None
         if self._workbook is not None:
             try:
                 self._workbook.close()
@@ -2390,6 +2532,12 @@ def _process_one_po(po, context, search_page, log):
                 result["fld_files"] = dl_result.get("fld_files", [])
                 result["non_fld_files"] = dl_result.get("non_fld_files", [])
                 log(f"  附件下载: FLD {len(result['fld_files'])} 个, 非FLD {len(result['non_fld_files'])} 个")
+
+                # 个别详情页的头部比附件区更晚稳定：首次读取 WBS 为空时，
+                # 在下载完成后再复查一次，避免把本来存在的 WBS 漏写为空。
+                if not result.get("wbs"):
+                    log("  ⓘ 首次未取得 WBS，附件下载后重新读取详情页头部...")
+                    result["wbs"] = _extract_wbs(detail_page, log)
 
                 has_fld = len(result["fld_files"]) > 0
 

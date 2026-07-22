@@ -25,6 +25,7 @@ import sys
 import time
 import traceback
 import threading
+import queue
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import ttkbootstrap as ttk
@@ -33,15 +34,23 @@ from download_period import monthly_download_dir
 
 # ═══════════════════ 配置区 ═══════════════════
 
-# 脚本所在目录（数据文件也放这里，替换同名文件即可更新）
+# 脚本所在目录
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(SCRIPT_DIR, "assets")
 TKE_LOGO_PATH = os.path.join(ASSETS_DIR, "tke-move-beyond.png")
 
-# 主数据文件
+# 主数据文件：工作台首次执行任务时由用户选择并在本次运行中复用。
+# 保留默认值，兼容直接调用模块函数和历史自动化测试。
 EXCEL_FILE = os.path.join(SCRIPT_DIR, "采购记录0701.xlsx")
 DOWNLOADS_ROOT_DIR = os.path.join(SCRIPT_DIR, "downloads")
 DOWNLOAD_DIR = monthly_download_dir(DOWNLOADS_ROOT_DIR)
+
+
+def _set_active_purchase_record(excel_path):
+    """设置当前工作台会话的采购记录文件。"""
+    global EXCEL_FILE
+    EXCEL_FILE = os.path.abspath(excel_path)
+    return EXCEL_FILE
 
 # 工厂清单（Plant → 区域 + 分公司 映射表，仅装潢品类需要）
 FACTORY_FILE = os.path.join(SCRIPT_DIR, "工厂清单 7.XLSX")
@@ -74,6 +83,9 @@ EXTRA_COLUMNS = [
 
 # ═══════════════════ 品类配置 ═══════════════════
 
+DATA_SHEET_PRICE_COLUMNS = ("老价格", "新价格", "Saving", "CHECK")
+
+
 CATEGORIES = {
     "装潢": {
         "label": "装潢",
@@ -84,6 +96,7 @@ CATEGORIES = {
         "content_filter": "装潢",                    # PM Tracking Content 列筛选关键词
         "insert_cols_after_order": [],               # 区域/分公司已由独立按钮处理
         "insert_col_at_end": None,                   # 在 Sheet1 末尾插入的列（None=不插入）
+        "data_sheet_exclude_columns": DATA_SHEET_PRICE_COLUMNS,
     },
     "外包板": {
         "label": "外包板",
@@ -94,6 +107,7 @@ CATEGORIES = {
         "content_filter": "外包板",
         "insert_cols_after_order": [],
         "insert_col_at_end": None,
+        "data_sheet_exclude_columns": DATA_SHEET_PRICE_COLUMNS,
     },
     "线槽": {
         "label": "线槽",
@@ -110,6 +124,7 @@ CATEGORIES = {
         },
         "insert_cols_after_order": [],
         "insert_col_at_end": None,
+        "data_sheet_exclude_columns": ("CHECK",),
     },
     "无线五方通话": {
         "label": "无线五方通话",
@@ -119,13 +134,15 @@ CATEGORIES = {
         "required_source_columns": ["物料", "订单净值", "短文本", "净价", "采购订单数量"],
         "data_extra_columns": ["老价格", "新价格", "Saving"],
         "price_list_sheet": "五方2026.05降价",
+        "price_match_mode": "material",
         "price_source_columns": {
-            "sap_description": 5,  # E=SAP Discription-Ner
+            "material": 2,         # B=PN(Material)
             "old_price": 8,        # H=老价格
             "new_price": 10,       # J=新价格
         },
         "insert_cols_after_order": [],
         "insert_col_at_end": None,
+        "data_sheet_exclude_columns": ("CHECK",),
     },
     "井道照明": {
         "label": "井道照明",
@@ -140,6 +157,7 @@ CATEGORIES = {
         "pivot_value_name": "求和项:PO数量",
         "insert_cols_after_order": [],
         "insert_col_at_end": None,
+        "data_sheet_exclude_columns": DATA_SHEET_PRICE_COLUMNS,
     },
     "空调": {
         "label": "空调",
@@ -626,6 +644,17 @@ def _enhance_and_filter(cfg, _log):
     if len(df_filtered) == 0:
         raise RuntimeError(f"[{label}] 筛选后无数据！物料 {filter_materials} 在数据中不存在。")
     _log(f"[{label}] 筛选后数据行数: {len(df_filtered)}")
+
+    # Sheet1 是所有品类共用的主数据表。价格列一旦被空调等品类加入，
+    # 不能再原样带入不使用它们的品类数据 Sheet。
+    excluded_columns = cfg.get("data_sheet_exclude_columns", ())
+    columns_to_drop = [
+        column_name for column_name in excluded_columns
+        if column_name in df_filtered.columns
+    ]
+    if columns_to_drop:
+        df_filtered = df_filtered.drop(columns=columns_to_drop)
+        _log(f"[{label}] 数据 Sheet 不保留列：{', '.join(columns_to_drop)}")
 
     # 井道照明只在独立数据 Sheet 中增加描述和计数辅助列，不能污染 Sheet1。
     if cfg.get("workflow") == "lighting_saving":
@@ -1192,6 +1221,15 @@ def _fill_data_price_category(category, price_file, status_callback=None):
     data_sheet_name = cfg["data_sheet"]
     price_list_sheet = cfg["price_list_sheet"]
     source_columns = cfg["price_source_columns"]
+    match_mode = cfg.get("price_match_mode", "short_text")
+    if match_mode == "material":
+        source_match_column = source_columns["material"]
+        data_match_header = "物料"
+        match_description = "物料 → PN(Material)"
+    else:
+        source_match_column = source_columns["sap_description"]
+        data_match_header = "短文本"
+        match_description = "短文本 → SAP Discription-Ner"
 
     def _status(message):
         if status_callback:
@@ -1209,12 +1247,22 @@ def _fill_data_price_category(category, price_file, status_callback=None):
             return None
         return number if math.isfinite(number) else None
 
+    def _match_key(value):
+        """规范化匹配键；物料号兼容 Excel 读出的 8001366263.0。"""
+        normalised = _normalise(value)
+        if match_mode != "material" or not normalised:
+            return normalised
+        number = _number(normalised)
+        if number is not None and number.is_integer():
+            return str(int(number))
+        return normalised
+
     if not os.path.exists(EXCEL_FILE):
         return False, f"找不到采购记录文件：\n{EXCEL_FILE}"
     if not price_file or not os.path.isfile(price_file):
         return False, f"找不到{label}价格表：\n{price_file or '未选择文件'}"
 
-    _status(f"正在读取{label}价格表并按短文本建立匹配索引...")
+    _status(f"正在读取{label}价格表并按{match_description}建立匹配索引...")
     try:
         price_book = openpyxl.load_workbook(
             price_file, read_only=True, data_only=True
@@ -1230,21 +1278,21 @@ def _fill_data_price_category(category, price_file, status_callback=None):
             f"当前可用 Sheet：{available}"
         )
 
-    price_by_short_text = {}
+    price_by_match_key = {}
     max_source_column = max(source_columns.values())
     try:
         price_sheet = price_book[price_list_sheet]
         for row in price_sheet.iter_rows(
             min_row=2, max_col=max_source_column, values_only=True
         ):
-            short_text = _normalise(row[source_columns["sap_description"] - 1])
-            if not short_text:
+            match_key = _match_key(row[source_match_column - 1])
+            if not match_key:
                 continue
             old_price = row[source_columns["old_price"] - 1]
             new_price = row[source_columns["new_price"] - 1]
             if old_price is None or new_price is None:
                 continue
-            price_by_short_text.setdefault(short_text, set()).add(
+            price_by_match_key.setdefault(match_key, set()).add(
                 (old_price, new_price)
             )
     finally:
@@ -1266,14 +1314,14 @@ def _fill_data_price_category(category, price_file, status_callback=None):
         if _normalise(worksheet.cell(1, column).value)
     }
     required_headers = (
-        "短文本", "净价", "采购订单数量", "老价格", "新价格", "Saving",
+        data_match_header, "净价", "采购订单数量", "老价格", "新价格", "Saving",
     )
     missing_headers = [header for header in required_headers if header not in headers]
     if missing_headers:
         workbook.close()
         return False, f"「{data_sheet_name}」缺少列：{', '.join(missing_headers)}。"
 
-    short_text_col = headers["短文本"]
+    match_value_col = headers[data_match_header]
     net_price_col = headers["净价"]
     order_quantity_col = headers["采购订单数量"]
     old_price_col = headers["老价格"]
@@ -1283,19 +1331,19 @@ def _fill_data_price_category(category, price_file, status_callback=None):
     matched_rows = 0
     saving_rows = 0
     saving_skipped = 0
-    unmatched_texts = set()
-    ambiguous_texts = set()
+    unmatched_values = set()
+    ambiguous_values = set()
     _status(f"正在匹配{label}老价格、新价格并计算 Saving...")
     for row_number in range(2, worksheet.max_row + 1):
-        short_text = _normalise(worksheet.cell(row_number, short_text_col).value)
-        if not short_text:
+        match_key = _match_key(worksheet.cell(row_number, match_value_col).value)
+        if not match_key:
             continue
-        candidates = price_by_short_text.get(short_text, set())
+        candidates = price_by_match_key.get(match_key, set())
         if len(candidates) == 0:
-            unmatched_texts.add(short_text)
+            unmatched_values.add(match_key)
             continue
         if len(candidates) > 1:
-            ambiguous_texts.add(short_text)
+            ambiguous_values.add(match_key)
             continue
 
         old_price, new_price = next(iter(candidates))
@@ -1331,14 +1379,14 @@ def _fill_data_price_category(category, price_file, status_callback=None):
 
     summary = [
         f"{label}老/新价格与 Saving 填充完成",
-        f"短文本 → SAP Discription-Ner 匹配：{matched_rows} 行",
+        f"{match_description} 匹配：{matched_rows} 行",
         f"Saving 已计算：{saving_rows} 行（老价格 - 净价）× 采购订单数量",
         f"价格表：{os.path.basename(price_file)} / {price_list_sheet}（H=老价格，J=新价格）",
     ]
-    if unmatched_texts:
-        summary.append("未匹配并保持为空：" + "、".join(sorted(unmatched_texts)))
-    if ambiguous_texts:
-        summary.append("价格存在歧义，未写入：" + "、".join(sorted(ambiguous_texts)))
+    if unmatched_values:
+        summary.append("未匹配并保持为空：" + "、".join(sorted(unmatched_values)))
+    if ambiguous_values:
+        summary.append("价格存在歧义，未写入：" + "、".join(sorted(ambiguous_values)))
     if saving_skipped:
         summary.append(f"Saving 保持为空：{saving_skipped} 行缺少有效老价格、净价或采购订单数量")
     return True, "\n".join(summary)
@@ -2003,6 +2051,12 @@ class PivotTableApp:
 
         self.active_category = "装潢"  # 默认品类
         self._web_stop_event = None
+        self._purchase_record_path = None
+        # 后台网页/Excel 任务的日志先进入线程安全队列；主线程定时批量刷新，
+        # 避免数百个 after 回调堆积后导致滚动和拖动卡顿。
+        self._status_update_queue = queue.SimpleQueue()
+        self._status_drain_after_id = None
+        self._workbench_destroyed = False
 
         # 高 DPI/低分辨率屏幕下，默认 760×780 可能高于逻辑屏幕；
         # 必须先收缩到可视区域内，否则标题栏会被挤到屏幕上方。
@@ -2015,6 +2069,34 @@ class PivotTableApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close_request)
 
         self._build_ui()
+        self.root.bind("<Destroy>", self._on_root_destroy, add="+")
+        self._schedule_status_drain()
+
+    def _on_root_destroy(self, event):
+        """窗口销毁时取消日志轮询，避免 Tk 报残留 after 回调错误。"""
+        if event.widget is not self.root:
+            return
+        self._stop_status_drain()
+
+    def _stop_status_drain(self):
+        """在用户关闭工作台前停止后台日志轮询。"""
+        self._workbench_destroyed = True
+        if self._status_drain_after_id is not None:
+            try:
+                self.root.after_cancel(self._status_drain_after_id)
+            except tk.TclError:
+                pass
+            self._status_drain_after_id = None
+
+    def _schedule_status_drain(self):
+        if self._workbench_destroyed:
+            return
+        try:
+            self._status_drain_after_id = self.root.after(
+                80, self._drain_queued_status_updates
+            )
+        except tk.TclError:
+            self._workbench_destroyed = True
 
     def _on_close_request(self):
         """提供界面内关闭入口，并在任务运行时提醒用户。"""
@@ -2038,7 +2120,60 @@ class PivotTableApp:
             parent=self.root,
         ):
             return
+        self._stop_status_drain()
         self.root.destroy()
+
+    def _ensure_purchase_record_selected(self):
+        """首次业务操作前选择采购记录，本次工作台会话内只选择一次。"""
+        if self._purchase_record_path and os.path.isfile(self._purchase_record_path):
+            return True
+
+        selected_file = filedialog.askopenfilename(
+            parent=self.root,
+            title="选择本月采购记录",
+            initialdir=SCRIPT_DIR,
+            filetypes=[("Excel 文件", "*.xlsx *.xlsm"), ("所有文件", "*.*")],
+        )
+        if not selected_file:
+            self._update_status("未选择采购记录，本次操作未执行。", "#f59e0b")
+            return False
+
+        selected_file = os.path.abspath(selected_file)
+        try:
+            import openpyxl
+            workbook = openpyxl.load_workbook(
+                selected_file, read_only=True, data_only=True
+            )
+            has_source_sheet = SOURCE_SHEET in workbook.sheetnames
+            workbook.close()
+        except Exception as exc:
+            messagebox.showerror(
+                "采购记录无法打开",
+                f"无法打开所选采购记录：\n{exc}",
+                parent=self.root,
+            )
+            return False
+
+        if not has_source_sheet:
+            messagebox.showerror(
+                "采购记录格式不正确",
+                f"所选文件缺少「{SOURCE_SHEET}」，请重新选择采购记录。",
+                parent=self.root,
+            )
+            return False
+
+        self._purchase_record_path = _set_active_purchase_record(selected_file)
+        self.lbl_current_record.config(
+            text=f"当前采购记录：{os.path.basename(self._purchase_record_path)}"
+        )
+        # 网页查询/回填模块拥有独立的模块全局变量，必须同步为同一个文件。
+        import web_query
+        web_query.set_purchase_record_file(self._purchase_record_path)
+        self._update_status(
+            f"已选择采购记录：{os.path.basename(self._purchase_record_path)}",
+            "#27ae60",
+        )
+        return True
 
     def _is_content_widget(self, widget):
         """判断事件来源是否位于可滚动的工作台正文中。"""
@@ -2211,17 +2346,12 @@ class PivotTableApp:
         # ── 顶部标题栏 ──
         category_buttons_per_row = 4
         category_rows = (len(CATEGORIES) + category_buttons_per_row - 1) // category_buttons_per_row
-        header_height = 180 + max(0, category_rows - 2) * 34
+        header_height = 142 + max(0, category_rows - 2) * 34
         header = tk.Frame(self.root, bg="#102a43", height=header_height)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
-        # 标题与品类切换占上行，窗口控制固定在下行。这样窗口变窄时不会让
-        # “停止查询”被标题、品类切换按钮挤出可视区域。
         header_main = tk.Frame(header, bg="#102a43")
-        header_main.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        header_actions = tk.Frame(header, bg="#0b2239", height=38)
-        header_actions.pack(side=tk.BOTTOM, fill=tk.X)
-        header_actions.pack_propagate(False)
+        header_main.pack(fill=tk.BOTH, expand=True)
 
         # 品类较多时使用两行均分布局；窄窗口也不会把最后一个入口或品牌标志
         # 挤出可视范围。每个按钮仍是独立可点击的工作台切换入口。
@@ -2258,22 +2388,12 @@ class PivotTableApp:
             brand, image=self.tke_header_logo, bg="#102a43",
         )
         self.lbl_tke_logo.pack(side=tk.LEFT)
-
-        # 窗口控制始终独占一行，确保缩小时三个关键按钮都不会被裁掉。
-        window_controls = tk.Frame(header_actions, bg="#0b2239")
-        window_controls.pack(side=tk.RIGHT, padx=(0, 20), pady=4)
-        self.btn_close = ttk.Button(
-            window_controls, text="关闭工作台",
-            bootstyle="danger", padding=(12, 6),
-            command=self._on_close_request,
+        self.lbl_current_record = tk.Label(
+            brand, text="当前采购记录：未选择（首次操作时选择）",
+            font=("Microsoft YaHei", 9), fg="#b8d4eb", bg="#102a43",
+            anchor=tk.W,
         )
-        self.btn_close.pack(side=tk.LEFT)
-        self.btn_stop_web = ttk.Button(
-            window_controls, text="⏹ 停止查询",
-            bootstyle="danger-outline", padding=(12, 6),
-            command=self._on_stop_web_click, state=tk.DISABLED,
-        )
-        self.btn_stop_web.pack(side=tk.LEFT, padx=(6, 0))
+        self.lbl_current_record.pack(side=tk.LEFT, padx=(16, 0))
 
         # 内容区可滚动：小屏或高 DPI 缩放时不会再为了容纳所有卡片把窗口
         # 顶出屏幕，窗口依然可以任意拖动和缩放。
@@ -2452,6 +2572,16 @@ class PivotTableApp:
             command=self._on_retry_missing_click,
         )
         self.btn_retry_missing.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+        # 只在网页查询或补查进行中出现。使用原生按钮指定前景色，避免部分
+        # Windows 主题把危险色 ttk 按钮的文字绘制成不可见。
+        self.btn_stop_web = tk.Button(
+            web_action_row, text="⏹ 停止查询",
+            font=("Microsoft YaHei", 9, "bold"),
+            fg="#ffffff", bg="#dc2626", activeforeground="#ffffff",
+            activebackground="#b91c1c", disabledforeground="#ffffff",
+            relief=tk.FLAT, borderwidth=0,
+            padx=12, pady=8, command=self._on_stop_web_click,
+        )
         self.hint3 = _hint(
             c2,
             "③ 首次查询下载全部 PO；若日志提示缺失，点击右侧「补查缺失 PO」仅重查缺失项（也可扫描旧运行结果）。",
@@ -2522,20 +2652,24 @@ class PivotTableApp:
 
     def _on_factory_click(self):
         """点击匹配区域/分公司（品类无关）"""
+        if not self._ensure_purchase_record_selected():
+            return
         self.btn_factory.config(state=tk.DISABLED, text="正在匹配...")
         self._update_status("正在匹配区域/分公司...", "#f59e0b")
 
         def _run():
             try:
                 success, msg = apply_factory_mapping(
-                    status_callback=lambda m: self.root.after(0, self._update_status, m, "#f59e0b")
+                    status_callback=lambda m: self._queue_status_update(m, "#f59e0b")
                 )
                 self.root.after(0, lambda: self._factory_done(success, msg))
             except Exception as e:
                 err_msg = f"错误：\n{e}\n\n{traceback.format_exc()}"
                 self.root.after(0, lambda: self._factory_done(False, err_msg))
 
-        self.root.after(100, _run)
+        # Excel / openpyxl 读写可能持续数分钟；after 仍是在 Tk 主线程执行，
+        # 必须交给后台线程，避免 Windows 把工作台标记为“未响应”。
+        threading.Thread(target=_run, daemon=True).start()
 
     def _factory_done(self, success, msg):
         self.btn_factory.config(state=tk.NORMAL, text="🔧 匹配区域/分公司")
@@ -2548,6 +2682,8 @@ class PivotTableApp:
 
     def _on_click(self):
         """点击生成透视表"""
+        if not self._ensure_purchase_record_selected():
+            return
         category = self.active_category
         label = CATEGORIES[category]["label"]
         self.btn.config(state=tk.DISABLED, text="处理中，请稍候...")
@@ -2557,27 +2693,57 @@ class PivotTableApp:
             try:
                 success, msg = generate_pivot_table(
                     category=category,
-                    status_callback=lambda m: self.root.after(0, self._update_status, m, "#e67e22")
+                    status_callback=lambda m: self._queue_status_update(m, "#e67e22")
                 )
                 self.root.after(0, lambda: self._done(success, msg))
             except Exception as e:
                 err_msg = f"未预料的错误：\n{e}\n\n{traceback.format_exc()}"
                 self.root.after(0, lambda: self._done(False, err_msg))
 
-        self.root.after(100, _run)
+        # 原生透视表创建会启动 Excel COM，绝不能占用 Tk 的消息循环。
+        threading.Thread(target=_run, daemon=True).start()
 
     def _update_status(self, msg, color):
+        self._apply_status_to_ui(msg, color)
+        self._append_log_lines([f"{time.strftime('%H:%M:%S')}  {msg}"])
+
+    def _queue_status_update(self, msg, color):
+        """供后台线程提交状态，不直接触碰 Tk 控件或创建 after 回调。"""
+        self._status_update_queue.put((str(msg), color))
+
+    def _drain_queued_status_updates(self):
+        """每 80ms 批量消费后台日志，保证鼠标滚动和窗口拖动顺畅。"""
+        self._status_drain_after_id = None
+        if self._workbench_destroyed:
+            return
+        updates = []
+        while len(updates) < 500:
+            try:
+                updates.append(self._status_update_queue.get_nowait())
+            except queue.Empty:
+                break
+        if updates:
+            latest_msg, latest_color = updates[-1]
+            self._apply_status_to_ui(latest_msg, latest_color)
+            now = time.strftime('%H:%M:%S')
+            self._append_log_lines([f"{now}  {msg}" for msg, _color in updates])
+        self._schedule_status_drain()
+
+    def _apply_status_to_ui(self, msg, color):
         self.lbl_status.config(text=msg, fg=color)
         self.lbl_workflow_state.config(text=f"● {msg}", fg=color)
-        # 同时写入日志区
-        ts = time.strftime("%H:%M:%S")
-        self._log(f"{ts}  {msg}")
 
     def _log(self, msg):
         """写入日志区（线程安全）"""
+        self._append_log_lines([msg])
+
+    def _append_log_lines(self, lines):
+        """一次写入一批日志，避免频繁重排 Text 控件。"""
+        if not lines:
+            return
         try:
             self.log_text.configure(state=tk.NORMAL)
-            self.log_text.insert(tk.END, msg + "\n")
+            self.log_text.insert(tk.END, "\n".join(lines) + "\n")
             self.log_text.see(tk.END)
             self.log_text.configure(state=tk.DISABLED)
         except Exception:
@@ -2649,6 +2815,8 @@ class PivotTableApp:
 
     def _on_extra_click(self):
         """点击添加扩展列"""
+        if not self._ensure_purchase_record_selected():
+            return
         category = self.active_category
         label = CATEGORIES[category]["label"]
         self.btn_extra.config(state=tk.DISABLED, text="正在添加...")
@@ -2662,7 +2830,8 @@ class PivotTableApp:
                 err_msg = f"未预料的错误：\n{e}\n\n{traceback.format_exc()}"
                 self.root.after(0, lambda: self._extra_done(False, err_msg))
 
-        self.root.after(100, _run)
+        # 扩展列处理同样涉及完整工作簿读写，使用后台线程保持界面可移动、可关闭。
+        threading.Thread(target=_run, daemon=True).start()
 
     def _extra_done(self, success, msg):
         self.btn_extra.config(state=tk.NORMAL, text="② 添加扩展列")
@@ -2679,12 +2848,24 @@ class PivotTableApp:
             return
         self._web_stop_event.set()
         self.btn_stop_web.config(
-            state=tk.DISABLED, text="⏹ 正在停止...", bootstyle="danger-outline"
+            state=tk.DISABLED, text="⏹ 正在停止..."
         )
         self._update_status("已请求停止：当前 PO 完成后将保存已下载文件并停止后续查询。", "#ef4444")
 
+    def _set_stop_query_visible(self, visible):
+        """停止按钮只在网页查询/补查期间显示，避免空闲时占用顶部空间。"""
+        if visible:
+            if not self.btn_stop_web.winfo_manager():
+                self.btn_stop_web.pack(
+                    side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0)
+                )
+            return
+        self.btn_stop_web.pack_forget()
+
     def _on_web_click(self):
         """点击查询并下载附件按钮（不回填 Excel）。"""
+        if not self._ensure_purchase_record_selected():
+            return
         category = self.active_category
         label = CATEGORIES[category]["label"]
         stop_event = threading.Event()
@@ -2692,8 +2873,9 @@ class PivotTableApp:
         self.btn_web.config(state=tk.DISABLED, text="正在查询并下载...")
         self.btn_retry_missing.config(state=tk.DISABLED, text="↻ 补查缺失 PO")
         self.btn_stop_web.config(
-            state=tk.NORMAL, text="⏹ 停止查询", bootstyle="danger"
+            state=tk.NORMAL, text="⏹ 停止查询"
         )
+        self._set_stop_query_visible(True)
         self._update_status(f"[{label}] 正在启动 Edge 查询附件...", "#6c63ff")
 
         def _run():
@@ -2704,7 +2886,7 @@ class PivotTableApp:
                 success, msg = web_query.query_and_download_attachments(
                     target_sheet=target_sheet,
                     category_label=category_label,
-                    status_callback=lambda m: self.root.after(0, self._update_status, m, "#6c63ff"),
+                    status_callback=lambda m: self._queue_status_update(m, "#6c63ff"),
                     stop_requested=stop_event,
                 )
                 self.root.after(0, lambda: self._web_done(success, msg, stop_event))
@@ -2724,8 +2906,9 @@ class PivotTableApp:
         self.btn_web.config(state=tk.NORMAL, text="③ 打开网站查询")
         self.btn_retry_missing.config(state=tk.NORMAL, text="↻ 补查缺失 PO")
         self.btn_stop_web.config(
-            state=tk.DISABLED, text="⏹ 停止查询", bootstyle="danger-outline"
+            state=tk.NORMAL, text="⏹ 停止查询"
         )
+        self._set_stop_query_visible(False)
         stopped = bool(stop_event and stop_event.is_set()) or msg.startswith("⏹")
         if stopped:
             self._update_status("查询已停止；已完成的附件可直接回填。", "#f59e0b")
@@ -2739,6 +2922,8 @@ class PivotTableApp:
 
     def _on_retry_missing_click(self):
         """扫描当前品类已有目录，只重新查询确实缺失的 PO。"""
+        if not self._ensure_purchase_record_selected():
+            return
         category = self.active_category
         label = CATEGORIES[category]["label"]
         stop_event = threading.Event()
@@ -2746,8 +2931,9 @@ class PivotTableApp:
         self.btn_web.config(state=tk.DISABLED, text="③ 打开网站查询")
         self.btn_retry_missing.config(state=tk.DISABLED, text="正在核对并补查...")
         self.btn_stop_web.config(
-            state=tk.NORMAL, text="⏹ 停止查询", bootstyle="danger"
+            state=tk.NORMAL, text="⏹ 停止查询"
         )
+        self._set_stop_query_visible(True)
         self._update_status(f"[{label}] 正在核对本地 PO 目录并补查缺失项...", "#475569")
 
         def _run():
@@ -2756,7 +2942,7 @@ class PivotTableApp:
                 success, msg = web_query.retry_missing_pos(
                     target_sheet=CATEGORIES[category]["target_sheet"],
                     category_label=CATEGORIES[category]["label"],
-                    status_callback=lambda m: self.root.after(0, self._update_status, m, "#475569"),
+                    status_callback=lambda m: self._queue_status_update(m, "#475569"),
                     stop_requested=stop_event,
                 )
                 self.root.after(0, lambda: self._retry_missing_done(success, msg, stop_event))
@@ -2777,8 +2963,9 @@ class PivotTableApp:
         self.btn_web.config(state=tk.NORMAL, text="③ 打开网站查询")
         self.btn_retry_missing.config(state=tk.NORMAL, text="↻ 补查缺失 PO")
         self.btn_stop_web.config(
-            state=tk.DISABLED, text="⏹ 停止查询", bootstyle="danger-outline"
+            state=tk.NORMAL, text="⏹ 停止查询"
         )
+        self._set_stop_query_visible(False)
         stopped = bool(stop_event and stop_event.is_set()) or msg.startswith("⏹")
         if stopped:
             self._update_status("补查已停止；已完成的附件会保留。", "#f59e0b")
@@ -2792,6 +2979,8 @@ class PivotTableApp:
 
     def _on_backfill_click(self):
         """点击回填按钮：只处理当前品类已下载的待回填任务。"""
+        if not self._ensure_purchase_record_selected():
+            return
         category = self.active_category
         label = CATEGORIES[category]["label"]
         self.btn_backfill.config(state=tk.DISABLED, text="正在解析并回填...")
@@ -2803,7 +2992,7 @@ class PivotTableApp:
                 success, msg = web_query.backfill_downloaded_results(
                     target_sheet=CATEGORIES[category]["target_sheet"],
                     category_label=CATEGORIES[category]["label"],
-                    status_callback=lambda m: self.root.after(0, self._update_status, m, "#0f9d8a")
+                    status_callback=lambda m: self._queue_status_update(m, "#0f9d8a")
                 )
                 self.root.after(0, lambda: self._backfill_done(success, msg))
             except Exception as e:
@@ -2823,6 +3012,8 @@ class PivotTableApp:
 
     def _on_tracking_click(self):
         """点击 PM Tracking 匹配按钮"""
+        if not self._ensure_purchase_record_selected():
+            return
         category = self.active_category
         label = CATEGORIES[category]["label"]
         self.btn_tracking.config(state=tk.DISABLED, text="正在匹配...")
@@ -2849,6 +3040,8 @@ class PivotTableApp:
 
     def _on_air_price_click(self):
         """选择价格表后，执行当前品类对应的价格填充流程。"""
+        if not self._ensure_purchase_record_selected():
+            return
         category = self.active_category
         cfg = CATEGORIES[category]
         if not cfg.get("price_list_sheet"):
@@ -2880,9 +3073,7 @@ class PivotTableApp:
                 success, msg = fill_category_old_new_prices(
                     category,
                     price_file,
-                    status_callback=lambda m: self.root.after(
-                        0, self._update_status, m, "#7c3aed"
-                    ),
+                    status_callback=lambda m: self._queue_status_update(m, "#7c3aed"),
                 )
                 self.root.after(0, lambda: self._air_price_done(category, success, msg))
             except Exception as exc:
