@@ -1,30 +1,29 @@
 @echo off
 setlocal EnableExtensions
-chcp 65001 >nul
 cd /d "%~dp0"
-title 采购自动化工作台
+title Procurement Automation Workbench
 
 if not exist "requirements.txt" (
-    echo [错误] 未找到 requirements.txt。请保持启动文件与项目文件在同一目录。
+    echo [ERROR] requirements.txt is missing. Keep this launcher in the project folder.
     goto :failed
 )
-if not exist "装潢透视表工具.py" (
-    echo [错误] 未找到主程序「装潢透视表工具.py」。
+if not exist "run_workbench.py" (
+    echo [ERROR] run_workbench.py is missing. Keep all project files together.
     goto :failed
 )
 
 call :find_python
 if not defined PYTHON_CMD (
-    echo [错误] 未找到可用的 Python 3。请联系维护人员安装 Python 后再重试。
+    echo [ERROR] Python 3 was not found. Ask the project maintainer for help.
     goto :failed
 )
 
 set "VENV_PY=.venv\Scripts\python.exe"
 if not exist "%VENV_PY%" (
-    echo 正在创建本机运行环境，首次运行请稍候...
+    echo Creating the local Python environment. Please wait...
     %PYTHON_CMD% -m venv .venv
     if errorlevel 1 (
-        echo [错误] 无法创建 .venv 运行环境。
+        echo [ERROR] Could not create the .venv environment.
         goto :failed
     )
     set "NEEDS_DEPENDENCIES=1"
@@ -38,7 +37,7 @@ if not exist ".venv\.requirements-installed.txt" (
 )
 
 if defined NEEDS_DEPENDENCIES (
-    echo 正在安装或更新运行依赖，首次运行请保持联网...
+    echo Installing or updating dependencies. Please keep this window online...
     "%VENV_PY%" -m pip install --upgrade pip
     if errorlevel 1 goto :failed
     "%VENV_PY%" -m pip install -r requirements.txt
@@ -47,18 +46,18 @@ if defined NEEDS_DEPENDENCIES (
 )
 
 if not exist ".venv\.playwright-msedge-ready.txt" (
-    echo 正在准备 Edge 自动化组件，首次运行请稍候...
+    echo Preparing the Edge automation component. Please wait...
     "%VENV_PY%" -m playwright install msedge
     if errorlevel 1 goto :failed
     > ".venv\.playwright-msedge-ready.txt" echo Edge automation component is ready.
 )
 
-echo 正在启动采购自动化工作台...
-"%VENV_PY%" "装潢透视表工具.py"
+echo Starting the procurement automation workbench...
+"%VENV_PY%" "run_workbench.py"
 set "EXIT_CODE=%ERRORLEVEL%"
 if not "%EXIT_CODE%"=="0" (
     echo.
-    echo [错误] 工作台异常退出，错误信息已保留在本窗口中。
+    echo [ERROR] The workbench stopped unexpectedly. Keep this window open and send a screenshot to the maintainer.
     pause
 )
 exit /b %EXIT_CODE%
@@ -78,6 +77,6 @@ exit /b 1
 
 :failed
 echo.
-echo 请将本窗口截图发送给维护人员。
+echo Keep this window open and send a screenshot to the maintainer.
 pause
 exit /b 1
